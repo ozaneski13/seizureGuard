@@ -77,6 +77,43 @@ class TestMakeClip:
         assert alert_clip.make_clip(event, None) is None
 
 
+class TestEventVideo:
+    def _fb(self, times, size=(64, 48)):
+        import sampling
+        fb = sampling.FrameBuffer()
+        for i, t in enumerate(times):
+            img = np.full((size[1], size[0], 3), (i * 5) % 255, np.uint8)
+            fb.append(t, cv2.imencode(".jpg", img)[1])
+        return fb
+
+    def test_full_rate_recording_written_with_sidecar(self, tmp_path):
+        fb = self._fb([i / 15.0 for i in range(90)])       # 6s at 15fps
+        out = alert_clip.save_event_video(fb, tmp_path, 0.0, 6.0)
+        assert out is not None and out.exists()
+        import json
+        times = json.loads((tmp_path / "event_times.json").read_text())["times"]
+        assert len(times) >= 80
+
+    def test_clip_prefers_full_rate_recording(self, tmp_path):
+        # Sparse saved frames (2fps) AND a full-rate recording (15fps):
+        # the clip must come from the recording, i.e. be much denser.
+        _fake_event(tmp_path, [i / 2.0 for i in range(12)])   # sparse 0..5.5s
+        fb = self._fb([i / 15.0 for i in range(90)])
+        alert_clip.save_event_video(fb, tmp_path, 0.0, 6.0)
+        out = alert_clip.make_clip(tmp_path, (0.0, 5.0))
+        assert out is not None
+        cap = cv2.VideoCapture(str(out))
+        n = 0
+        while cap.read()[0]:
+            n += 1
+        cap.release()
+        assert n >= 60                    # ~5s at 15fps, not 2fps
+
+    def test_too_few_ring_frames_returns_none(self, tmp_path):
+        fb = self._fb([0.0, 0.1])
+        assert alert_clip.save_event_video(fb, tmp_path, 0.0, 1.0) is None
+
+
 class TestPeakWindow:
     def test_centered_on_first_peak(self):
         import pytest

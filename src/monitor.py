@@ -31,7 +31,8 @@ OUT_ROOT = Path("data/events")
 
 # Ring buffer
 BUFFER_SECONDS = 90.0
-RING_INTERVAL = 0.1          # store at most 10 fps in the ring (~27 MB)
+RING_INTERVAL = 1.0 / 15.0   # store at most 15 fps in the ring (~40 MB) —
+                             # also the frame rate of the alert video clips
 
 # Trigger FSM (motion_score units; calibrate with --log-motion on real footage)
 MOTION_ON = 2.5              # sustained score to arm an event
@@ -263,6 +264,7 @@ def handle_event(ring, motion_history, start, end, out_root, use_verify, name="m
         n += 1
     base_saved, burst_saved, peaks = save_event_frames(
         fb, list(motion_history), event_dir, t0, end)
+    alert_clip.save_event_video(fb, event_dir, t0, end)
     print(f"✅ Event captured: {event_dir} "
           f"({base_saved} base + {burst_saved} burst, {end - start:.1f}s of motion)")
 
