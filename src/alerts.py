@@ -76,3 +76,12 @@ def send_alert(text, photo_path=None):
                 time.sleep(2)
     print("🚨 ALERT (telegram delivery failed):", text)
     return False
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+    message = " ".join(sys.argv[1:]) or "seizureGuard alert test"
+    delivered = send_alert(message)
+    print("telegram delivered:", delivered)
