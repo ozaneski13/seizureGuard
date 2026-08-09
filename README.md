@@ -59,6 +59,11 @@ is saved as:
 
 Frames are resized so the longest side is 640 px (aspect preserved).
 
+Separately from the analysis sampling, the event's **full-rate frames
+(~15 fps) are saved as `event.mp4`** straight from the ring buffer — this
+recording is what alert clips are cut from, so the video you receive plays
+smoothly regardless of how sparsely the AI sampled the event.
+
 ### Step 3 — Pose gate (optional, local, free)
 
 If you set up the pose model, a YOLO pose network finds the dog's keypoints
@@ -92,10 +97,11 @@ pure OR over batches — recall first, nothing can veto a positive.
 
 A positive event sends a Telegram message with a **5–10 second video clip
 cut from the exact window the verifier was most confident about** — you see
-the motion itself, not a single ambiguous frame. If clip encoding fails for
-any reason, the alert falls back to the peak-moment photo, then to plain
-text; delivery problems never block or crash the monitor. Without Telegram
-configured, alerts print to the console/log.
+the motion itself, not a single ambiguous frame. The clip is cut from the
+full-rate `event.mp4` recording (~15 fps); for events without one it falls
+back to stitching the sparse analysis frames, then to the peak-moment
+photo, then to plain text — delivery problems never block or crash the
+monitor. Without Telegram configured, alerts print to the console/log.
 
 ---
 
@@ -296,7 +302,7 @@ python -m pytest
 Fully offline: builds a synthetic video (seizure-like jitter, a lighting
 flash that must never trigger, moderate motion), runs the real extraction and
 monitor pipeline on it, and stubs the AI backends. No API key, no login, no
-GPU needed. 122 tests.
+GPU needed. 139 tests.
 
 ## Data & privacy
 
@@ -304,7 +310,9 @@ Everything under `data/` (captured frames, events, eval clips) plus `models/`
 and the pose venv is gitignored — camera footage is private and must never be
 committed. With verification disabled the footage never leaves your machine
 at all; with it enabled, only sampled event frames are sent to the AI
-backend you configured.
+backend you configured. The full-rate `event.mp4` recording never goes to
+the AI — it leaves your machine only as the alert clip sent to your own
+Telegram chat.
 
 ## Results & research
 
