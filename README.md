@@ -6,8 +6,9 @@
 
 Watches your dog through a home camera, 24/7. When it sees motion that looks
 like an epileptic seizure, it sends a Telegram message to your phone with a
-photo — verified by a vision AI that checks for actual canine seizure signs
-(paddling, rigid posture, rhythmic jerking) before alerting you.
+short video clip of the moment — verified by a vision AI that checks for
+actual canine seizure signs (paddling, rigid posture, rhythmic jerking)
+before alerting you.
 
 Evaluated on real clinical seizure footage: **4/4 published veterinary seizure
 videos detected** — including one documented as missed by a commercial
@@ -25,7 +26,7 @@ caveats in [EVAL.md](EVAL.md).
 ```
 camera ──► 1. motion detection ──► 2. frame sampling ──► 3. pose gate ──► 4. AI verify ──► 5. alert
             (is something            (save the right      (optional,       (does it look     (Telegram
-             moving?)                 frames)              local, free)     like a seizure?)   + photo)
+             moving?)                 frames)              local, free)     like a seizure?)   + video clip)
 ```
 
 ### Step 1 — Motion detection (cheap, runs on every frame)
