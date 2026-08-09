@@ -20,6 +20,7 @@ import cv2
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
+import alert_clip  # noqa: E402
 import alerts  # noqa: E402
 from sampling import (  # noqa: E402
     WIDTH, HEIGHT, FrameBuffer, encode_jpg, is_global_change,
@@ -280,7 +281,16 @@ def handle_event(ring, motion_history, start, end, out_root, use_verify, name="m
     else:
         text = f"Motion event captured (unverified) — {event_dir.name}"
 
-    alerts.send_alert(text, photo_path=peak_frame_path(event_dir, peaks, t0))
+    # Clip from the window the verifier was most confident about; peak
+    # window for unverified events; photo fallback if encoding fails.
+    if verdict is not None:
+        window = alert_clip.best_batch_window(verdict, alert_clip.event_frames(event_dir))
+    else:
+        window = alert_clip.peak_window(peaks, t0)
+    clip = alert_clip.make_clip(event_dir, window)
+
+    alerts.send_alert(text, photo_path=peak_frame_path(event_dir, peaks, t0),
+                      video_path=clip)
     return event_dir
 
 

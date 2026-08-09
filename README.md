@@ -90,9 +90,12 @@ pure OR over batches — recall first, nothing can veto a positive.
 
 ### Step 5 — Alert
 
-A positive event sends a Telegram message with the frame from the first
-motion peak attached, so you can judge in two seconds whether to run home.
-Without Telegram configured, alerts print to the console/log.
+A positive event sends a Telegram message with a **5–10 second video clip
+cut from the exact window the verifier was most confident about** — you see
+the motion itself, not a single ambiguous frame. If clip encoding fails for
+any reason, the alert falls back to the peak-moment photo, then to plain
+text; delivery problems never block or crash the monitor. Without Telegram
+configured, alerts print to the console/log.
 
 ---
 

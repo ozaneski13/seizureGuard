@@ -86,6 +86,47 @@ class TestTelegram:
         assert alerts.send_alert("msg", photo_path=tmp_path / "gone.jpg") is True
         assert "sendMessage" in requests[0].full_url
 
+    def test_video_goes_to_sendvideo_multipart(self, tg_env, monkeypatch, tmp_path):
+        clip = tmp_path / "alert_clip.mp4"
+        clip.write_bytes(b"\x00\x00\x00 ftypmp42fakevideo")
+        photo = tmp_path / "peak.jpg"
+        photo.write_bytes(b"\xff\xd8fakejpg")
+        requests = []
+        _capture_urlopen(monkeypatch, requests)
+        assert alerts.send_alert("seizure?", photo_path=photo, video_path=clip) is True
+        req = requests[0]
+        assert "sendVideo" in req.full_url
+        assert b'name="video"' in req.data
+        assert b"fakevideo" in req.data
+
+    def test_missing_video_falls_back_to_photo(self, tg_env, monkeypatch, tmp_path):
+        photo = tmp_path / "peak.jpg"
+        photo.write_bytes(b"\xff\xd8fakejpg")
+        requests = []
+        _capture_urlopen(monkeypatch, requests)
+        assert alerts.send_alert("msg", photo_path=photo,
+                                 video_path=tmp_path / "gone.mp4") is True
+        assert "sendPhoto" in requests[0].full_url
+
+    def test_failing_video_upload_retries_without_clip(self, tg_env, monkeypatch, tmp_path):
+        clip = tmp_path / "c.mp4"
+        clip.write_bytes(b"vid")
+        photo = tmp_path / "p.jpg"
+        photo.write_bytes(b"\xff\xd8jpg")
+        urls = []
+
+        @__import__("contextlib").contextmanager
+        def fake(req, timeout=None):
+            urls.append(req.full_url)
+            if "sendVideo" in req.full_url:
+                raise OSError("upload too slow")
+            yield _FakeResponse()
+
+        monkeypatch.setattr(alerts.urllib.request, "urlopen", fake)
+        assert alerts.send_alert("evt", photo_path=photo, video_path=clip) is True
+        assert any("sendVideo" in u for u in urls)
+        assert "sendPhoto" in urls[-1]
+
     def test_network_failure_never_raises(self, tg_env, monkeypatch, capsys):
         calls = []
 

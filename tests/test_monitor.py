@@ -155,8 +155,10 @@ class TestIntegration:
     @pytest.fixture
     def alert_calls(self, monkeypatch):
         calls = []
-        monkeypatch.setattr(monitor.alerts, "send_alert",
-                            lambda text, photo_path=None: calls.append((text, photo_path)))
+        monkeypatch.setattr(
+            monitor.alerts, "send_alert",
+            lambda text, photo_path=None, video_path=None:
+                calls.append((text, photo_path, video_path)))
         return calls
 
     @pytest.fixture
@@ -182,9 +184,10 @@ class TestIntegration:
 
     def test_unverified_alert_sent_per_event(self, events, alert_calls):
         assert len(alert_calls) == len(events)
-        text, photo = alert_calls[0]
+        text, photo, video = alert_calls[0]
         assert "unverified" in text
         assert photo is not None
+        assert video is not None          # clip built around the first peak
 
     def test_event_dir_structure(self, events):
         first = events[0]

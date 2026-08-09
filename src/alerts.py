@@ -39,8 +39,14 @@ def _post(url, data, content_type):
         return resp.status == 200
 
 
-def _send_telegram(token, chat, text, photo_path):
-    if photo_path is not None and Path(photo_path).exists():
+def _send_telegram(token, chat, text, photo_path, video_path=None):
+    if video_path is not None and Path(video_path).exists():
+        content_type, body = _multipart(
+            {"chat_id": chat, "caption": text},
+            "video", Path(video_path).name, Path(video_path).read_bytes(),
+        )
+        url = f"https://api.telegram.org/bot{token}/sendVideo"
+    elif photo_path is not None and Path(photo_path).exists():
         content_type, body = _multipart(
             {"chat_id": chat, "caption": text},
             "photo", Path(photo_path).name, Path(photo_path).read_bytes(),
@@ -53,8 +59,9 @@ def _send_telegram(token, chat, text, photo_path):
     return _post(url, body, content_type)
 
 
-def send_alert(text, photo_path=None):
+def send_alert(text, photo_path=None, video_path=None):
     """Deliver an alert. Telegram when configured, console otherwise.
+    Prefers the video clip, falls back to the photo, then to plain text.
 
     Never raises — an alert failure must not kill the monitor loop.
     Returns True only when a Telegram message was actually delivered.
@@ -65,6 +72,8 @@ def send_alert(text, photo_path=None):
     if not token or not chat:
         print("=" * 60)
         print("🚨 ALERT:", text)
+        if video_path is not None:
+            print("   clip:", video_path)
         if photo_path is not None:
             print("   frame:", photo_path)
         print("   (set SEIZUREGUARD_TG_TOKEN / SEIZUREGUARD_TG_CHAT for Telegram delivery)")
@@ -73,12 +82,16 @@ def send_alert(text, photo_path=None):
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            if _send_telegram(token, chat, text, photo_path):
+            if _send_telegram(token, chat, text, photo_path, video_path):
                 return True
         except Exception as e:
             print(f"[WARN] Telegram alert attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
             if attempt < MAX_ATTEMPTS:
                 time.sleep(2)
+        # A failing video upload must not take the whole alert down with it:
+        # retry without the clip so at least the photo/text gets through.
+        if video_path is not None and attempt == MAX_ATTEMPTS - 1:
+            video_path = None
     print("🚨 ALERT (telegram delivery failed):", text)
     return False
 
