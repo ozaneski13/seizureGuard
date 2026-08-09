@@ -11,6 +11,9 @@ import verify_event as ve
 def _fast(monkeypatch):
     monkeypatch.setattr(ve.time, "sleep", lambda s: None)
     monkeypatch.delenv("SEIZUREGUARD_BACKEND", raising=False)
+    # CI runners have no claude binary; the which() preflight must not gate
+    # tests whose subprocess layer is mocked anyway.
+    monkeypatch.setattr(ve.shutil, "which", lambda name: "claude")
 
 
 def _is_screen(prompt):
