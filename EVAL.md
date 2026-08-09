@@ -1,6 +1,6 @@
 # EVAL — First real-footage evaluation
 
-**Date:** 2026-08-09 · **Pipeline:** commit `b142ce8` · **Verify backend:** `claude-cli`
+**Date:** 2026-08-09 · **Pipeline:** as of the 2026-08-09 NUDFT/segmentation fixes · **Verify backend:** `claude-cli`
 (screen `claude-haiku-4-5`, confirm `claude-sonnet-5`)
 
 ## Headline

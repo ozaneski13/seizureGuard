@@ -1,3 +1,8 @@
+"""Alert delivery: Telegram (with optional photo) when SEIZUREGUARD_TG_TOKEN
+and SEIZUREGUARD_TG_CHAT are set, console fallback otherwise. Never raises.
+
+Test your setup: python src/alerts.py "hello"
+"""
 import os
 import time
 import urllib.error

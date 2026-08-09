@@ -1,7 +1,13 @@
-"""Dog-centering PTZ tracker for a pan-capable camera behind the local PTZ
-gateway (ptz_server.py). Detects the dog with YOLO, keeps it horizontally
-centered with small rate-limited pan steps, and coordinates with the monitor
-through a moving-flag file so self-commanded motion never reads as an event.
+"""Dog-centering PTZ tracker for a pan-capable camera behind a local PTZ
+gateway. Detects the dog with YOLO, keeps it horizontally centered with
+small rate-limited pan steps, and coordinates with the monitor through a
+moving-flag file so self-commanded motion never reads as an event.
+
+The gateway itself is NOT part of this repo — any HTTP service satisfying
+one endpoint works:
+
+    GET {SEIZUREGUARD_PTZ_URL}/api/ptz?cam=<name>&dir=<left|right|up|down>&steps=<n>
+    -> {"ok": true}
 
 Design constraints measured on the mi360 (2026-08-09): one motor step is
 ~18 px at 640 width, command-to-settle is ~1.5 s, and rapid command bursts

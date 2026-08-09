@@ -1,3 +1,10 @@
+"""Two-tier VLM verification of a captured event directory: a cheap screen
+model triages each 30-frame batch, positives escalate to a strong confirm
+model that assesses specific canine seizure signs; a deterministic rule
+layer decides, recall-first. Writes analysis.json into the event dir.
+
+Usage: python src/verify_event.py <event_dir>
+"""
 import base64
 import json
 import os

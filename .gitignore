@@ -206,9 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-.idea/
-.venv/
-
 # Captured footage and outputs — private home-camera data, never commit
 data/*
 !data/.gitkeep

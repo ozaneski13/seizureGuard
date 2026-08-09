@@ -1,3 +1,9 @@
+"""Continuous seizure monitor: watches a camera/stream/file through a ring
+buffer, turns sustained motion into captured events, and runs each event
+through the pose gate and VLM verification before alerting.
+
+Usage: python src/monitor.py --source <index|file|rtsp url> [--name cam]
+"""
 import argparse
 import json
 import os

@@ -1,5 +1,9 @@
 # seizureGuard
 
+[![tests](https://github.com/ozaneski13/seizureGuard/actions/workflows/ci.yml/badge.svg)](https://github.com/ozaneski13/seizureGuard/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+
 Watches your dog through a home camera, 24/7. When it sees motion that looks
 like an epileptic seizure, it sends a Telegram message to your phone with a
 photo — verified by a vision AI that checks for actual canine seizure signs
@@ -29,8 +33,9 @@ camera ──► 1. motion detection ──► 2. frame sampling ──► 3. po
 Every frame is compared with the previous one:
 
 1. Convert both frames to grayscale, take the absolute pixel difference.
-2. Blur the difference (kills camera noise), threshold it, and measure what
-   fraction of the image changed. That single number is the **motion score**.
+2. Blur the difference (kills camera noise), threshold it, and average the
+   result — a 0–255 score proportional to how much of the image changed
+   (~2.5 ≈ 1% of pixels). That single number is the **motion score**.
 3. If *more than 60%* of the image changed at once, it's a lighting event
    (lamp switched on, auto-exposure) — never counted as motion.
 
@@ -85,7 +90,7 @@ pure OR over batches — recall first, nothing can veto a positive.
 
 ### Step 5 — Alert
 
-A positive event sends a Telegram message with the frame from the strongest
+A positive event sends a Telegram message with the frame from the first
 motion peak attached, so you can judge in two seconds whether to run home.
 Without Telegram configured, alerts print to the console/log.
 
@@ -276,6 +281,8 @@ Watch the printed scores during normal activity, then adjust `MOTION_ON` /
 | `SEIZUREGUARD_POSE_MODEL` | `models/dog-pose.pt` | pose model weights |
 | `SEIZUREGUARD_TG_TOKEN` / `SEIZUREGUARD_TG_CHAT` | — | Telegram bot token + chat id |
 | `SEIZUREGUARD_MOVING_FLAG` | — | flag file marking self-commanded PTZ motion |
+| `SEIZUREGUARD_PTZ_URL` | `http://127.0.0.1:1985` | PTZ gateway base URL (tracker; gateway not included — see `src/tracker.py`) |
+| `SEIZUREGUARD_TRACK_MODEL` | `yolo11n.pt` | detection model for the PTZ tracker |
 
 ## Tests
 

@@ -16,6 +16,7 @@ Get-ChildItem $logDir -Filter "*.err" | Where-Object {
     $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
     Remove-Item -Force -Confirm:$false -ErrorAction SilentlyContinue
 
+# Edit: one entry per camera (name -> RTSP URL)
 $cams = @{
     "mi360" = "rtsp://127.0.0.1:8554/mi360_h264"
     "c700"  = "rtsp://127.0.0.1:8554/c700_h264"

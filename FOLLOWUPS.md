@@ -4,8 +4,8 @@ Open items and next steps, ordered by value. Status as of 2026-08-09.
 
 ## Needs real footage (blocked on data, not code)
 
-- **Re-test on the original camera export (2025-12-26 ~11:00 event).** The
-  first owner recording (WhatsApp screen recording of app playback) fired the
+- **Re-test on the original camera export of the first captured seizure.**
+  The first owner recording (a screen recording of app playback) fired the
   alert, but forensics showed fragile detection: the convulsing dog sits at
   the frame edge partially cropped by app UI, playback has multi-second time
   jumps (camera clock jumped 6 s within 0.3 s of video), and both VLM tiers
@@ -13,8 +13,10 @@ Open items and next steps, ordered by value. Status as of 2026-08-09.
   sampled densely. A direct export from the camera app (no screen recording,
   no WhatsApp re-compression) is the fair test. Deployment guidance from the
   same footage: place the camera so resting spots are centered, and mind the
-  mirrored wardrobe — the dog's reflection is a plausible VLM distractor.
-  Upside: this video exposed the pose-gate fail-open hole (fixed, `98b052f`).
+  mirrored furniture or glass — the dog's reflection is a plausible VLM
+  distractor.
+  Upside: this video exposed the pose-gate fail-open hole (fixed the same
+  day: detection-rate and unscorable-segment fail-open branches).
   A same-frames model A/B then showed haiku+sonnet calling all 6 seizure
   batches normal while fable-5 flagged all 6 with hard signs (conf up to
   0.65) — confirm default switched to fable-5, and the screen tier gained a
@@ -116,7 +118,7 @@ off/on) plus ~20 min; exact cause unproven, so the tracker's gentle rate
 limits stay mandatory. Also learned: concurrent commands from the panel
 and the API produce gateway 502s (device errors under contention) —
 harmless, but the tracker must tolerate them. The camera was successfully
-re-aimed at the dog's hallway area through the gateway afterwards, and the
+re-aimed at the dog's resting area through the gateway afterwards, and the
 monitor captured zero junk events during all pans (2 s sustain + global
 -change filtering absorb manual repositioning naturally).
 
