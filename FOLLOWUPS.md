@@ -63,7 +63,7 @@ consumes the cameras' **subtype=1 substreams** (mi360 640×360, c700
 transcode runs on the Pi and total load is a few percent CPU. Claude CLI
 was already installed and logged in on the Pi (`/usr/local/bin/claude`),
 so verify is ON end to end. Logs: `journalctl -u seizureguard-mi360`.
-Code updates: `scripts/deploy-pi.ps1` (scp + service restart).
+Code updates ship via a small scp + service-restart helper.
 
 The Windows path (start-seizureguard.ps1 + Startup shortcut + hourly
 watchdog task) was **decommissioned at cutover** — the script stays in the
