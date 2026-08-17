@@ -193,9 +193,13 @@ def run_claude(prompt, model, images, timeout=300):
     stdin = json.dumps({"type": "user",
                         "message": {"role": "user", "content": content}}) + "\n"
 
+    # --no-session-persistence: without it every call writes a transcript
+    # containing the base64 frames (~2-3 MB) under ~/.claude/projects —
+    # 8 days of 24/7 monitoring filled 11 GB of a Pi SD card that way.
     proc = subprocess.run(
         [exe, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
          "--verbose", "--model", model, "--max-turns", "1",
+         "--no-session-persistence",
          "--system-prompt", SYSTEM_CONTRACT],
         input=stdin, capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=timeout,

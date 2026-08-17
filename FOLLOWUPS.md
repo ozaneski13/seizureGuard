@@ -88,9 +88,19 @@ Standing constraints:
   sessions. Pi holds one per camera (substream). Windows go2rtc grabs
   another only while its streams are consumed (PTZ panel iframe, tracker,
   scans) — fine, but don't run Windows monitors again in parallel.
-- **`data/events/` on the Pi SD card** (16 GB free) — every event is a few
-  MB; deliberately not auto-deleted (future training set). Prune when disk
-  matters.
+- **Disk hygiene (learned 2026-08-17 from a disk alert at 94%):** two
+  leaks, both closed. (1) Every headless `claude -p` call persisted a
+  transcript *containing the base64 frames* under `~/.claude/projects` —
+  ~4,900 verify calls in 8 days = 11 GB; fixed with
+  `--no-session-persistence` (regression-tested) and the old transcripts
+  deleted. (2) `data/events/` grows ~30 events/day (~3 GB/8 days);
+  `scripts/prune_events.py` now runs daily (`seizureguard-prune.timer`,
+  04:20): keeps 14 days plus **every verifier-positive event forever**
+  (training set), deletes older negatives.
+- **First live false-alarm figure:** 8 days of 24/7 monitoring, ~230
+  motion events captured, **0 alerts** — every event was rejected by the
+  verifier. (No seizure occurred in that window, so this measures the
+  false-alarm side only.)
 - Pose gate is NOT active on the Pi (no `SEIZUREGUARD_POSE_PYTHON`):
   every event goes straight to verify. It only ever saved cost, never
   recall. If quota becomes noisy, port it via NCNN export.

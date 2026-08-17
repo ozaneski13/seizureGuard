@@ -162,11 +162,15 @@ class TestRunClaude:
         captured = {}
 
         def fake(cmd, **kwargs):
+            captured["cmd"] = cmd
             captured["stdin"] = kwargs.get("input")
             return self._proc(self._stream('{"seen": "no", "confidence": 0.0}'))
 
         monkeypatch.setattr(ve.subprocess, "run", fake)
         ve.run_claude("p", "m", images=[frame])
+        # Regression: persisted transcripts embed the frames and filled a
+        # Pi SD card (11 GB in 8 days) — headless calls must not persist.
+        assert "--no-session-persistence" in captured["cmd"]
         msg = json.loads(captured["stdin"])
         blocks = msg["message"]["content"]
         assert blocks[0]["type"] == "text"
