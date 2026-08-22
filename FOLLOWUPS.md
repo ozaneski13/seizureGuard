@@ -131,6 +131,32 @@ credentials are not durable enough for an unattended machine.
 **Lesson worth keeping:** a component that reports health from local
 state rather than from doing its actual job will eventually lie. Probe
 the work, not the flag.
+
+**Resolved 2026-08-22.** A long-lived token now lives in the service
+units and the first real verdict in 13 days came back clean (8/8 batches
+analyzed, 0 failures). One trap cost an hour and is worth remembering:
+**a stale `~/.claude/.credentials.json` silently overrides
+`CLAUDE_CODE_OAUTH_TOKEN`** — a brand-new valid token kept reporting
+"access token has expired" until the stored file was moved aside. The
+tell: an intentionally bogus token produces the same "expired" error
+instead of "invalid". `~/setup-claude-token.sh` now clears it first.
+
+Two quality issues surfaced by that first clean run (neither is a safety
+risk; both are open):
+
+- **The screen tier no longer filters anything.** On plainly normal
+  footage haiku returned `{"seen": "yes", "confidence": 0.05,
+  "posture": "standing"}` with a note reading "Normal ambulation
+  throughout... no jerking, paddling, stiffening" — so `should_escalate`
+  fires on every batch and each event pays for a full confirm pass. The
+  field name "seen" is ambiguous (the model appears to answer "did I see
+  the dog/frames"). Fix: rename it to something unmistakable
+  (`abnormal_seen`) and state the question in one line.
+- **`final_confidence` is meaningless for negatives.** It is the max
+  batch confidence, and the confirm model reports confidence *in its
+  verdict*, so a clearly normal event reported 0.85. Alerts only show it
+  for positives, so nothing user-facing is wrong, but do not compare it
+  across positive/negative events.
 - Pose gate is NOT active on the Pi (no `SEIZUREGUARD_POSE_PYTHON`):
   every event goes straight to verify. It only ever saved cost, never
   recall. If quota becomes noisy, port it via NCNN export.
