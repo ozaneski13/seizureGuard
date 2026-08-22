@@ -243,7 +243,13 @@ def alert_text_for(verdict, event_name):
         return f"Motion event captured (unverified) - {event_name}"
     if verdict.get("final_abnormal_event"):
         conf = float(verdict.get("final_confidence") or 0.0)
-        return f"Abnormal motor event detected (confidence {conf:.2f}) - {event_name}"
+        pos = verdict.get("positive_batches")
+        total = len(verdict.get("batches") or [])
+        # How much of the event looked abnormal is the fastest triage signal:
+        # a real seizure flagged 6/7 batches, false alarms flagged 1/7.
+        span = f", {pos}/{total} segments" if pos and total else ""
+        return (f"Abnormal motor event detected (confidence {conf:.2f}{span})"
+                f" - {event_name}")
     failed = int(verdict.get("failed_batches") or 0)
     if failed:
         total = len(verdict.get("batches") or []) or failed

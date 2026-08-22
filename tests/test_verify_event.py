@@ -330,3 +330,59 @@ class TestEndToEnd:
         monkeypatch.setattr(sys, "argv", ["verify_event.py", str(synthetic_event_dir)])
         with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
             ve.main()
+
+
+class TestConfidenceSemantics:
+    """Regression: final_confidence used to be the max over ALL analyzed
+    batches, so a plainly normal event reported 0.85 and a real alert quoted
+    0.85 while its only positive batch scored 0.45."""
+
+    def _run(self, monkeypatch, event_dir, verdicts):
+        seq = list(verdicts)
+
+        def fake(prompt, model, images, timeout=600):
+            if _is_screen(prompt):
+                return {"seen": "yes", "confidence": 0.9}
+            return seq.pop(0) if seq else {
+                "abnormal_event": False, "confidence": 0.1, "observed_signs": []}
+
+        monkeypatch.setattr(ve, "run_claude", fake)
+        return _run_main(monkeypatch, event_dir)
+
+    def test_negative_event_does_not_report_positive_confidence(
+            self, monkeypatch, synthetic_event_dir):
+        out = self._run(monkeypatch, synthetic_event_dir, [
+            {"abnormal_event": False, "confidence": 0.85, "observed_signs": []}])
+        assert out["final_abnormal_event"] is False
+        assert out["positive_batches"] == 0
+
+    def test_positive_confidence_comes_from_a_positive_batch(
+            self, monkeypatch, synthetic_event_dir):
+        out = self._run(monkeypatch, synthetic_event_dir, [
+            {"abnormal_event": False, "confidence": 0.85, "observed_signs": []},
+            {"abnormal_event": True, "confidence": 0.45,
+             "observed_signs": [{"sign": "paddling", "present": True,
+                                 "body_region": "legs", "sustained": True}]},
+        ])
+        assert out["final_abnormal_event"] is True
+        assert out["final_confidence"] == 0.45      # not the 0.85 negative batch
+        assert out["positive_batches"] == 1
+
+
+class TestSignDefinitionsInPrompt:
+    """The false alarms came from bare sign names read in their everyday
+    sense; the prompt must carry the clinical definition and its exclusion."""
+
+    def test_confirm_prompt_defines_signs_with_exclusions(self):
+        prompt = ve.confirm_prompt([])
+        assert "SUDDEN INVOLUNTARY COLLAPSE" in prompt
+        assert "NOT lying down" in prompt
+        assert "circling before lying down" in prompt      # disorientation
+        assert "NOT motion blur" in prompt                 # drooling
+        assert "MUST be flagged" in prompt                 # recall side
+        assert "Voluntary behaviour is never a sign" in prompt
+
+    def test_every_sign_has_a_definition(self):
+        prompt = ve.confirm_prompt([])
+        for sign in ve.ALL_SIGNS:
+            assert f"- {sign}:" in prompt, f"{sign} tanimsiz"

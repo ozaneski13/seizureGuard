@@ -144,6 +144,61 @@ instead of "invalid". `~/setup-claude-token.sh` now clears it first.
 Two quality issues surfaced by that first clean run (neither is a safety
 risk; both are open):
 
+## False alarms from undefined sign vocabulary (fixed 2026-08-23)
+
+Within two hours of verification coming back online the system sent two
+alerts on a dog that was only walking around. The cause was not the rule
+layer or the models' judgment — it was vocabulary. The prompt listed the
+ten sign names with no definitions, so they were read in their everyday
+sense:
+
+- a dog settling onto the floor -> `loss_of_posture` (a HARD sign, so one
+  occurrence alerts), body_region text: "drops from standing to a low
+  lateral position"
+- circling before lying down -> `disorientation`
+- motion blur around the muzzle of a trotting dog -> `drooling`, plus
+  `head_tremor` — two soft signs, which the rule layer also treats as
+  positive
+
+In both events the model's own free-text note said "coordinated",
+"goal-directed", "consistent with normal behavior" while its structured
+fields said otherwise. Bare terms invited the everyday reading.
+
+Fix: `SIGN_DEFINITIONS` gives every sign a clinical definition **and its
+exclusion** ("loss_of_posture: SUDDEN INVOLUNTARY COLLAPSE ... NOT lying
+down, settling to rest, rolling over"), plus a two-sided rule.
+
+**The two-sided rule matters more than the definitions.** The first
+attempt ended with a one-sided rule ("if the behaviour is voluntary and
+goal-directed, every sign is false"). Re-running all three reference
+events showed it silenced both false alarms *and the real seizure*
+(6/6 positive batches -> 0/6): the model took the escape hatch and
+described convulsive thrashing as "purposeful, controlled walking". The
+shipped rule states both directions — what is never a sign, and what MUST
+be flagged (on-side rapid limb movement, legs giving way, thrashing
+without righting, 2-6 Hz jerking) — with "if torn, flag it".
+
+Validation on real footage, same three events, before and after:
+
+| Event | Before | One-sided rule | Shipped |
+|---|---|---|---|
+| Walking dog (false alarm 1) | ALERT 1/7 | silent | **silent 0/7** |
+| Walking dog (false alarm 2) | ALERT 1/7 | silent | **silent 0/7** |
+| Real seizure (owner footage) | ALERT 6/6 | *silent 0/6* | **ALERT 2/6** |
+
+Watch item: the true positive's margin narrowed from 6/6 to 2/6 positive
+batches. It still fires (the event rule is a pure OR), and separation from
+the negatives is clean, but a subtler seizure has less headroom than
+before. Re-check this table whenever the prompt changes.
+
+Also fixed in the same pass: `final_confidence` is now the confidence of
+the *finding* (max over positive batches) instead of the max over all
+analyzed batches — a normal event used to report 0.85, and the first false
+alarm quoted 0.85 while its only positive batch scored 0.45. Alerts now
+also carry how much of the event looked abnormal ("2/7 segments"), which
+is the fastest triage signal: the real seizure spans many segments, false
+alarms one.
+
 - **The screen tier no longer filters anything.** On plainly normal
   footage haiku returned `{"seen": "yes", "confidence": 0.05,
   "posture": "standing"}` with a note reading "Normal ambulation

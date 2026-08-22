@@ -35,6 +35,38 @@ POSTURES = ("standing", "sitting", "lying_sternal", "lying_lateral", "unclear")
 
 # Learned from the first owner recording: the convulsing dog sat at the frame
 # edge while its mirror reflection read as a healthy standing dog.
+# Every sign below fired as a false positive on ordinary behaviour before it
+# had a definition: a dog settling down read as "loss_of_posture", circling
+# before lying down as "disorientation", motion blur as "drooling". The
+# exclusions are the load-bearing half.
+SIGN_DEFINITIONS = """Sign definitions - a sign is present ONLY if the movement is INVOLUNTARY:
+- paddling: rhythmic swimming-like limb motion while lying down, unable to rise. NOT walking, running, digging or scratching.
+- tonic_stiffening: sustained rigid extension of limbs/neck/trunk the dog cannot release. NOT stretching, bracing or standing still.
+- rhythmic_jerking: repetitive involuntary whole-body or limb jerks (roughly 2-6 per second). NOT gait, shaking water off, or scratching.
+- jaw_clonus: repetitive involuntary jaw chomping. NOT chewing, panting, yawning or licking.
+- loss_of_posture: SUDDEN INVOLUNTARY COLLAPSE - the dog falls or its legs give way and it cannot get up. NOT lying down, settling to rest, rolling over, or sleeping. A dog that chooses to lie down has NOT lost posture.
+- fencing_posture: one forelimb rigidly extended while the other is flexed, held that way.
+- drooling: visible saliva strands or a clearly wet muzzle. NOT motion blur, shadow, or a dark patch.
+- head_tremor: involuntary repetitive head oscillation while otherwise still. NOT looking around, sniffing, or shaking.
+- muscle_twitching: localized involuntary muscle rippling. NOT normal movement or breathing.
+- disorientation: post-seizure confusion - aimless pacing, bumping into objects, unresponsive staring. NOT sniffing, exploring, or circling before lying down.
+
+Two-sided rule. Voluntary behaviour is never a sign: walking, trotting,
+settling down, circling before lying down, stretching, scratching,
+shaking off, sniffing and playing are normal however vigorous or blurred
+they look, and blurred frames are evidence of speed, not of a sign.
+
+Involuntary events are the opposite and MUST be flagged: a dog lying on
+its side with rapid repetitive limb movement; legs giving way; thrashing
+or rolling while unable to right itself; repetitive jerking at roughly
+2-6 per second; rigid limbs held extended. Flag these even when
+individual frames are blurred and even if the dog seems to move around
+the room between episodes - seizures start and stop.
+
+If you are genuinely torn between the two readings, flag it.
+"""
+
+
 VISION_CAUTIONS = (
     "Judge only the physical dog: rooms may contain mirrors or glass whose "
     "reflections look like a second dog — never base your verdict on a "
@@ -156,7 +188,9 @@ def confirm_prompt(paths):
         + VISION_CAUTIONS +
         "Assess each of these specific canine seizure signs across the sequence: "
         f"{', '.join(ALL_SIGNS)}.\n"
-        "We prefer false positives over misses.\n\n"
+        + SIGN_DEFINITIONS +
+        "We prefer false positives over misses, but only for genuinely "
+        "involuntary movement - normal behaviour must read as normal.\n\n"
         "Reply with exactly this JSON object and nothing else:\n"
         "{\n"
         '  "abnormal_event": true or false,\n'
@@ -421,11 +455,16 @@ def main():
     # A seizure that ended is still a seizure that happened — nothing may veto a true.
     any_true = any(r.get("abnormal_event") is True for r in batch_results)
     failed_batches = sum(1 for r in batch_results if r.get("abnormal_event") is None)
-    max_conf = max(
-        (float(r.get("confidence", 0.0)) for r in batch_results
-         if r.get("abnormal_event") is not None),
-        default=0.0,
-    )
+    # Confidence OF THE FINDING. Taking the max over all analyzed batches
+    # let a plainly normal event report 0.85 (the confirm model reports
+    # confidence in its own verdict, not seizure probability), and an alert
+    # quoted 0.85 while its single positive batch was only 0.45.
+    positive_conf = [float(r.get("confidence", 0.0)) for r in batch_results
+                     if r.get("abnormal_event") is True]
+    analyzed_conf = [float(r.get("confidence", 0.0)) for r in batch_results
+                     if r.get("abnormal_event") is not None]
+    max_conf = max(positive_conf) if positive_conf else (
+        max(analyzed_conf) if analyzed_conf else 0.0)
 
     final = any_true
     if any_true:
@@ -449,6 +488,7 @@ def main():
         "num_frames": len(frames),
         "base_frames": len(list(base_dir.glob("frame_*.jpg"))),
         "burst_frames": len(list(burst_dir.glob("frame_*.jpg"))),
+        "positive_batches": len(positive_conf),
         "failed_batches": failed_batches,
         "final_reason": final_reason,
         "batches": batch_results,
