@@ -194,3 +194,74 @@ class TestIntegration:
         assert (first / "base").is_dir()
         assert (first / "burst").is_dir()
         assert list((first / "burst").glob("frame_*.jpg"))
+
+
+class TestAlertTextFor:
+    """Regression: a verify run whose batches all failed was treated as
+    'negative' and silenced the alert. 383 production events went through
+    that path unnoticed."""
+
+    def _verdict(self, positive=False, failed=0, batches=8, conf=0.0):
+        return {
+            "final_abnormal_event": positive,
+            "final_confidence": conf,
+            "failed_batches": failed,
+            "batches": [{}] * batches,
+        }
+
+    def test_analyzed_negative_stays_silent(self):
+        assert monitor.alert_text_for(self._verdict(), "ev") is None
+
+    def test_positive_alerts_with_confidence(self):
+        text = monitor.alert_text_for(self._verdict(positive=True, conf=0.65), "ev")
+        assert "0.65" in text and "ev" in text
+
+    def test_all_batches_failed_alerts_unverified(self):
+        text = monitor.alert_text_for(self._verdict(failed=8, batches=8), "ev")
+        assert text is not None
+        assert "UNVERIFIED" in text and "8/8" in text
+
+    def test_partial_failure_also_alerts(self):
+        text = monitor.alert_text_for(self._verdict(failed=1, batches=8), "ev")
+        assert text is not None and "1/8" in text
+
+    def test_positive_wins_over_failures(self):
+        text = monitor.alert_text_for(
+            self._verdict(positive=True, failed=3, conf=0.4), "ev")
+        assert "Abnormal" in text and "UNVERIFIED" not in text
+
+    def test_no_verdict_is_unverified(self):
+        assert "unverified" in monitor.alert_text_for(None, "ev")
+
+
+class TestVerifyProbe:
+    def _proc(self, stdout="", returncode=0, stderr=""):
+        import types
+        return types.SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+    def test_working_backend_probes_ok(self, monkeypatch):
+        monkeypatch.setattr(monitor.shutil, "which", lambda n: "claude")
+        monkeypatch.setattr(monitor.subprocess, "run",
+                            lambda *a, **k: self._proc("OK"))
+        assert monitor.verify_probe() == (True, None)
+
+    def test_expired_token_is_caught(self, monkeypatch):
+        monkeypatch.setattr(monitor.shutil, "which", lambda n: "claude")
+        monkeypatch.setattr(monitor.subprocess, "run", lambda *a, **k: self._proc(
+            "", 1, "API Error: 401 OAuth access token has expired"))
+        ok, reason = monitor.verify_probe()
+        assert ok is False and "401" in reason
+
+    def test_missing_cli_is_caught(self, monkeypatch):
+        monkeypatch.setattr(monitor.shutil, "which", lambda n: None)
+        ok, reason = monitor.verify_probe()
+        assert ok is False and "not found" in reason
+
+    def test_crash_never_raises(self, monkeypatch):
+        monkeypatch.setattr(monitor.shutil, "which", lambda n: "claude")
+
+        def boom(*a, **k):
+            raise OSError("no process")
+
+        monkeypatch.setattr(monitor.subprocess, "run", boom)
+        assert monitor.verify_probe()[0] is False

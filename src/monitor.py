@@ -207,6 +207,51 @@ def verify_enabled():
     return claude_available()
 
 
+def verify_probe():
+    """One real inference call proving verification actually works.
+
+    `claude auth status` keeps reporting loggedIn after the OAuth token
+    expires, so a monitor can log "verify: on" while every call fails with
+    401 — that happened for 13 days on the production Pi. Returns
+    (ok, reason)."""
+    exe = shutil.which("claude")
+    if exe is None:
+        return False, "claude CLI not found on PATH"
+    model = os.environ.get("SEIZUREGUARD_SCREEN_MODEL", "claude-haiku-4-5")
+    try:
+        proc = subprocess.run(
+            [exe, "-p", "--model", model, "--max-turns", "1",
+             "--no-session-persistence", "Reply with exactly: OK"],
+            capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return False, str(e)[:200]
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if proc.returncode == 0 and "OK" in out:
+        return True, None
+    return False, (out[:200] or f"exit {proc.returncode}")
+
+
+def alert_text_for(verdict, event_name):
+    """Alert text for a verify result, or None when the event was actually
+    analyzed and found negative.
+
+    Batches that never returned a verdict are NOT evidence of absence: the
+    unanalyzed batch may be the one holding the seizure. Treating a failed
+    verification as "negative" is silent blindness — the one failure mode
+    this project refuses."""
+    if verdict is None:
+        return f"Motion event captured (unverified) - {event_name}"
+    if verdict.get("final_abnormal_event"):
+        conf = float(verdict.get("final_confidence") or 0.0)
+        return f"Abnormal motor event detected (confidence {conf:.2f}) - {event_name}"
+    failed = int(verdict.get("failed_batches") or 0)
+    if failed:
+        total = len(verdict.get("batches") or []) or failed
+        return (f"UNVERIFIED motion event - AI verification failed on "
+                f"{failed}/{total} batches - {event_name}")
+    return None
+
+
 def run_pose_gate(event_dir):
     """Returns 'skip' | 'escalate'. Fail-open: any problem means escalate."""
     pose_python = os.environ.get("SEIZUREGUARD_POSE_PYTHON")
@@ -274,14 +319,10 @@ def handle_event(ring, motion_history, start, end, out_root, use_verify, name="m
         return event_dir
 
     verdict = run_verify(event_dir) if use_verify else None
-    if verdict is not None:
-        if not verdict.get("final_abnormal_event"):
-            print("[INFO] verify: event negative; not alerting")
-            return event_dir
-        text = (f"Abnormal motor event detected "
-                f"(confidence {verdict.get('final_confidence', 0):.2f}) — {event_dir.name}")
-    else:
-        text = f"Motion event captured (unverified) — {event_dir.name}"
+    text = alert_text_for(verdict, event_dir.name)
+    if text is None:
+        print("[INFO] verify: event analyzed and negative; not alerting")
+        return event_dir
 
     # Clip from the window the verifier was most confident about; peak
     # window for unverified events; photo fallback if encoding fails.
@@ -339,6 +380,13 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
     use_verify = verify_enabled()
     print(f"✅ Monitoring {'file' if file_mode else 'camera'} {source} "
           f"(verify: {'on' if use_verify else 'off'})")
+    if use_verify and os.environ.get("SEIZUREGUARD_BACKEND", "claude-cli") == "claude-cli":
+        ok, reason = verify_probe()
+        if not ok:
+            warning = (f"seizureGuard: AI verification is DOWN ({reason}). "
+                       "Motion alerts will be sent unverified until it is fixed.")
+            print("[WARN]", warning, flush=True)
+            alerts.send_alert(warning)
 
     ring = RingBuffer()
     trigger = MotionTrigger()

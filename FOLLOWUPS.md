@@ -97,10 +97,40 @@ Standing constraints:
   `scripts/prune_events.py` now runs daily (`seizureguard-prune.timer`,
   04:20): keeps 14 days plus **every verifier-positive event forever**
   (training set), deletes older negatives.
-- **First live false-alarm figure:** 8 days of 24/7 monitoring, ~230
-  motion events captured, **0 alerts** — every event was rejected by the
-  verifier. (No seizure occurred in that window, so this measures the
-  false-alarm side only.)
+- **CORRECTION — there is no live false-alarm figure yet.** An earlier
+  note here read the ~230 captured events' `final_abnormal_event: false`
+  as "the verifier rejected them". It did not: `failed_batches` equalled
+  the batch count on every one. See the outage below.
+
+## Silent verification outage (found 2026-08-22, the project's worst bug)
+
+Every verify call on the Pi failed from the very first event (2026-08-09
+21:04) through 2026-08-22 — 383 events, **zero successfully analyzed** —
+with `401 OAuth access token has expired`. Two independent defects let it
+run unnoticed for 13 days:
+
+1. **Silent blindness.** `handle_event` treated any result without
+   `final_abnormal_event` as negative and stayed quiet, even when every
+   batch had failed. `analysis.json` said "treat this result as
+   incomplete"; the monitor ignored it. A seizure in that window would
+   not have alerted. Fixed: `alert_text_for()` (pure, regression-tested)
+   alerts as UNVERIFIED whenever any batch failed and the event was not
+   confirmed positive — an unanalyzed batch is not evidence of absence.
+2. **A health check that could not fail.** `claude auth status` keeps
+   reporting `loggedIn: true` after the token expires, so startup logged
+   "verify: on" while nothing worked. Fixed: `verify_probe()` makes one
+   real inference call at startup and sends a Telegram warning when
+   verification is down.
+
+Operational fix for a headless 24/7 host: a long-lived token
+(`claude setup-token`) installed into the service units as
+`CLAUDE_CODE_OAUTH_TOKEN` via `~/setup-claude-token.sh` (prompts
+silently, validates with a real call, restarts the services) — session
+credentials are not durable enough for an unattended machine.
+
+**Lesson worth keeping:** a component that reports health from local
+state rather than from doing its actual job will eventually lie. Probe
+the work, not the flag.
 - Pose gate is NOT active on the Pi (no `SEIZUREGUARD_POSE_PYTHON`):
   every event goes straight to verify. It only ever saved cost, never
   recall. If quota becomes noisy, port it via NCNN export.
