@@ -164,6 +164,43 @@ Fix, in two pieces:
   meanwhile. Recovery is announced once too. A positive verdict still
   alerts immediately even mid-outage.
 
+### The screen tier cannot be used to save money (measured 2026-09-02)
+
+Two attempts to make the cheap tier filter, both reverted:
+
+1. **Ask the question properly.** The field was renamed `seen` ->
+   `abnormal_seen` and the question stated in one sentence with the
+   voluntary-behaviour exclusions. On the two false-alarm events this cut
+   expensive calls from 7/7 to 2/7 and 3/7 — real savings. But the model
+   then reported *certainty of its own answer* in `confidence` on other
+   batches (`abnormal_seen: "no"` with `confidence: 0.95`), which sailed
+   past the 0.15 escalation threshold, so the gate was still driven by a
+   number whose meaning the model changes at will.
+2. **Make the gate categorical** (`yes` / `no` / `unsure`, escalate unless
+   a clear no). This removed the numeric ambiguity — and on the reference
+   seizure the screen model answered **"no" on all six batches**, with
+   notes reading "normal purposeful walking". Zero escalations, seizure
+   missed completely.
+
+That is the finding: **a "no" from the cheap tier is not evidence of
+absence.** It matches the August model A/B, where haiku and sonnet called
+every batch of the same seizure normal and only fable flagged it. The tier
+was never filtering — it was accidentally answering "yes" to everything,
+which is why the pipeline worked.
+
+`should_escalate()` is therefore a documented no-op: it returns True
+always, and the docstring carries this measurement so the optimization is
+not attempted a third time. The screen call still runs for its cheap
+metadata (posture, note); dropping it entirely is a defensible follow-up.
+
+Cost must come from somewhere that cannot cost recall:
+- fewer frames per event (base sampling 2 fps -> 1 fps; bursts carry the
+  signal and stay untouched) — the cheapest lever, ~30-40% fewer batches
+- fewer events (motion threshold calibration for the actual room)
+- the local pose gate on the Pi (free, but measured to escalate most real
+  footage anyway)
+- a stronger screen model, which inverts the economics and is pointless
+
 **Root cause of the outage is cost, and it is not fixed.** Every batch
 escalates to the expensive confirm model because the screen tier returns
 `seen: "yes"` even on plainly normal footage (see the open item below), so

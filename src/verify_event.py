@@ -165,17 +165,23 @@ def decide_signs(verdict):
 
 
 def should_escalate(screen_verdict):
-    """Screen tier gate: escalate unless confidently negative (fail-open).
+    """Screen tier gate — deliberately a near no-op, and here is why.
 
-    Lateral recumbency always escalates regardless of confidence: a dog flat
-    on its side with any motion is the classic ictal presentation, and the
-    screen tier has misread it as normal on real footage."""
-    if screen_verdict is None:
-        return True
-    seen = str(screen_verdict.get("seen", "")).strip().lower()
-    conf = float(screen_verdict.get("confidence", 1.0))
-    posture = str(screen_verdict.get("posture", "")).strip().lower()
-    return seen == "yes" or conf >= SCREEN_ESCALATE_CONF or posture == "lying_lateral"
+    Measured on the owner's real seizure footage (2026-09-02): the cheap
+    screen model answered `abnormal_seen: "no"` on ALL SIX batches, with
+    notes like "normal purposeful walking", while the confirm model reading
+    the same frames reports paddling and loss of posture. The August A/B
+    said the same thing: haiku and sonnet called every seizure batch normal;
+    only fable flagged them.
+
+    So a "no" from this tier is not evidence of absence, and the tier cannot
+    be used to save money without dropping real seizures - two attempts to
+    make it filter both silenced the reference seizure. It stays as cheap
+    metadata (posture, a note) and escalates everything.
+
+    Cost has to come from somewhere else: fewer frames per event, or a
+    stronger screen model, not from trusting this one's negatives."""
+    return True
 
 
 # ------------------------------------------------------- claude-cli backend
@@ -200,20 +206,35 @@ def _timestamps(paths):
 
 
 def screen_prompt(paths):
+    """Cheap triage tier.
+
+    The field used to be called "seen", which the model read as "did you see
+    the dog": it answered yes on plainly normal footage with confidence 0.05,
+    so every batch escalated to the expensive confirm model and burned the
+    quota. The question is now asked explicitly, in one sentence."""
     return (
-        "You are screening frames from a dog monitoring camera for abnormal motor "
-        "events (possible epileptic seizure). This is NOT medical diagnosis.\n"
+        "You are screening frames from a dog monitoring camera. This is NOT "
+        "medical diagnosis.\n"
         f"Frame timestamps in seconds (same order as the attached images): {_timestamps(paths)}\n"
         "Frames are sampled at 2 fps normally and 10 fps during motion bursts, so gaps vary.\n"
         + VISION_CAUTIONS +
-        "We strongly prefer false positives over misses. If unsure, lean towards yes.\n\n"
+        "THE QUESTION: is an abnormal, INVOLUNTARY motor event (possible "
+        "epileptic seizure) visible in these frames?\n"
+        "Answer no for ordinary behaviour however vigorous it looks - walking, "
+        "running, playing, settling down, circling before lying down, "
+        "stretching, scratching, shaking off, sniffing, sleeping. Motion blur "
+        "means speed, not a seizure.\n"
+        "Answer yes for involuntary movement: a dog on its side with rapid "
+        "repetitive limb motion, legs giving way, thrashing without being able "
+        "to right itself, repetitive jerking, rigidly held limbs. If you truly "
+        "cannot tell, answer unsure - a miss costs far more than a second look.\n\n"
         "Reply with exactly this JSON object and nothing else:\n"
-        '{"seen": "yes" or "no", "confidence": <number 0..1, likelihood an abnormal '
-        'motor event is present in these frames>, '
+        '{"abnormal_seen": "yes" or "no" or "unsure", '
+        '"confidence": <number 0..1, informational only>, '
         f'"posture": "<dominant posture, one of: {", ".join(POSTURES)}>", '
-        '"note": "<optional short remark>"}\n'
-        "If no dog is visible — wrong scene, empty room, synthetic/test imagery — that IS "
-        'a valid result: {"seen": "no", "confidence": 0.0, "note": "no dog visible"}.'
+        '"note": "<one short sentence>"}\n'
+        "If no dog is visible - wrong scene, empty room, synthetic imagery - that IS "
+        'a valid result: {"abnormal_seen": "no", "confidence": 0.0, "note": "no dog visible"}.'
     )
 
 
