@@ -20,9 +20,6 @@ SCREEN_ATTEMPTS = 1     # screen failure escalates anyway (fail-open)
 CONFIRM_ATTEMPTS = 2
 MAX_ATTEMPTS = CONFIRM_ATTEMPTS  # openai backend
 
-# Recall-first: screen escalates unless it is confidently negative
-SCREEN_ESCALATE_CONF = 0.15
-
 # Canine seizure semiology vocabulary (IVETF/JVIM-informed)
 HARD_SIGNS = {
     "paddling", "tonic_stiffening", "rhythmic_jerking",
