@@ -265,3 +265,58 @@ class TestVerifyProbe:
 
         monkeypatch.setattr(monitor.subprocess, "run", boom)
         assert monitor.verify_probe()[0] is False
+
+
+class TestOutageNotifier:
+    """A backend outage repeats identically on every event. Alerting per
+    event trains the owner to ignore the one channel that must not be
+    ignored, so the outage itself is announced instead."""
+
+    def test_first_outage_notifies(self):
+        n = monitor.OutageNotifier(interval=3600)
+        notify, skipped = n.should_notify(1000.0)
+        assert notify is True and skipped == 0
+
+    def test_repeat_events_are_suppressed(self):
+        n = monitor.OutageNotifier(interval=3600)
+        n.should_notify(1000.0)
+        for i in range(1, 6):
+            notify, skipped = n.should_notify(1000.0 + i)
+            assert notify is False
+            assert skipped == i
+
+    def test_reminder_after_interval_reports_backlog(self):
+        n = monitor.OutageNotifier(interval=3600)
+        n.should_notify(1000.0)
+        for i in range(1, 4):
+            n.should_notify(1000.0 + i)
+        notify, skipped = n.should_notify(1000.0 + 3601)
+        assert notify is True
+        assert skipped == 3          # events silently unchecked meanwhile
+
+    def test_recovery_is_reported_once(self):
+        n = monitor.OutageNotifier()
+        n.should_notify(1000.0)
+        assert n.recovered() is True
+        assert n.recovered() is False    # already announced
+
+    def test_no_recovery_message_without_outage(self):
+        assert monitor.OutageNotifier().recovered() is False
+
+
+class TestOutageIsNotAPerEventAlert:
+    def test_outage_verdict_produces_no_event_alert(self):
+        verdict = {"final_abnormal_event": False, "failed_batches": 7,
+                   "batches": [{}] * 7, "backend_outage": "You've hit your limit"}
+        assert monitor.alert_text_for(verdict, "ev") is None
+
+    def test_plain_failure_still_alerts_unverified(self):
+        verdict = {"final_abnormal_event": False, "failed_batches": 7,
+                   "batches": [{}] * 7, "backend_outage": None}
+        assert "UNVERIFIED" in monitor.alert_text_for(verdict, "ev")
+
+    def test_positive_event_alerts_even_during_an_outage(self):
+        verdict = {"final_abnormal_event": True, "final_confidence": 0.6,
+                   "positive_batches": 2, "failed_batches": 3,
+                   "batches": [{}] * 7, "backend_outage": "limit"}
+        assert "Abnormal" in monitor.alert_text_for(verdict, "ev")

@@ -231,6 +231,37 @@ def verify_probe():
     return False, (out[:200] or f"exit {proc.returncode}")
 
 
+OUTAGE_REMINDER_SEC = 6 * 3600   # how often to repeat "still blind"
+
+
+class OutageNotifier:
+    """Announces a backend outage once, then at most every few hours.
+
+    Alerting per event during an outage is worse than useless: the backend
+    fails identically on all of them, so ~30 identical messages a day train
+    the owner to ignore the channel that must never be ignored. Silence is
+    not an option either, so the outage itself is the alert."""
+
+    def __init__(self, interval=OUTAGE_REMINDER_SEC):
+        self.interval = interval
+        self.last_notice = None
+        self.suppressed = 0
+
+    def should_notify(self, now):
+        if self.last_notice is None or now - self.last_notice >= self.interval:
+            self.last_notice = now
+            n, self.suppressed = self.suppressed, 0
+            return True, n
+        self.suppressed += 1
+        return False, self.suppressed
+
+    def recovered(self):
+        was_down = self.last_notice is not None
+        self.last_notice = None
+        self.suppressed = 0
+        return was_down
+
+
 def alert_text_for(verdict, event_name):
     """Alert text for a verify result, or None when the event was actually
     analyzed and found negative.
@@ -250,6 +281,8 @@ def alert_text_for(verdict, event_name):
         span = f", {pos}/{total} segments" if pos and total else ""
         return (f"Abnormal motor event detected (confidence {conf:.2f}{span})"
                 f" - {event_name}")
+    if verdict.get("backend_outage"):
+        return None          # handled once by OutageNotifier, not per event
     failed = int(verdict.get("failed_batches") or 0)
     if failed:
         total = len(verdict.get("batches") or []) or failed
@@ -300,7 +333,9 @@ def peak_frame_path(event_dir, peaks, t_start):
     return min(frames, key=lambda p: abs(t_of(p) - target))
 
 
-def handle_event(ring, motion_history, start, end, out_root, use_verify, name="monitor"):
+def handle_event(ring, motion_history, start, end, out_root, use_verify,
+                 name="monitor", outage_notifier=None):
+    outage_notifier = outage_notifier or OutageNotifier()
     t0 = start - PRE_ROLL_SEC
     fb = ring.snapshot(t0, end)
     if len(fb) == 0:
@@ -325,9 +360,23 @@ def handle_event(ring, motion_history, start, end, out_root, use_verify, name="m
         return event_dir
 
     verdict = run_verify(event_dir) if use_verify else None
+    outage = (verdict or {}).get("backend_outage")
+    if outage:
+        notify, skipped = outage_notifier.should_notify(time.time())
+        if notify:
+            extra = f" ({skipped} further events since the last notice)" if skipped else ""
+            alerts.send_alert(
+                f"seizureGuard: AI verification unavailable{extra} - motion is "
+                f"still being recorded but NOT checked. Reason: {outage}")
+        else:
+            print(f"[WARN] verification unavailable ({outage}); "
+                  f"{skipped} events unchecked", flush=True)
+    elif outage_notifier.recovered():
+        alerts.send_alert("seizureGuard: AI verification is back online.")
+
     text = alert_text_for(verdict, event_dir.name)
     if text is None:
-        print("[INFO] verify: event analyzed and negative; not alerting")
+        print("[INFO] verify: no alert for this event")
         return event_dir
 
     # Clip from the window the verifier was most confident about; peak
@@ -399,6 +448,7 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
     motion_history = deque()
     watchdog = StreamWatchdog()
     moving_flag = MovingFlag(os.environ.get("SEIZUREGUARD_MOVING_FLAG"))
+    outage_notifier = OutageNotifier()
     events = []
     prev_gray = None
     frame_idx = 0
@@ -456,14 +506,14 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
         ev = trigger.feed(t, score, glob)
         if ev is not None:
             done = handle_event(ring, motion_history, ev[0], ev[1], out_root,
-                                use_verify, name)
+                                use_verify, name, outage_notifier)
             if done is not None:
                 events.append(done)
 
     ev = trigger.flush()
     if ev is not None:
         done = handle_event(ring, motion_history, ev[0], ev[1], out_root,
-                            use_verify, name)
+                            use_verify, name, outage_notifier)
         if done is not None:
             events.append(done)
 

@@ -386,3 +386,28 @@ class TestSignDefinitionsInPrompt:
         prompt = ve.confirm_prompt([])
         for sign in ve.ALL_SIGNS:
             assert f"- {sign}:" in prompt, f"{sign} tanimsiz"
+
+
+class TestBackendOutageClassification:
+    def test_quota_error_is_an_outage(self):
+        assert ve.is_backend_outage("claude CLI error: You've hit your limit · resets Sep 5")
+
+    def test_auth_errors_are_outages(self):
+        assert ve.is_backend_outage("401 OAuth access token has expired")
+        assert ve.is_backend_outage("Not logged in · Please run /login")
+
+    def test_parse_failure_is_not_an_outage(self):
+        assert ve.is_backend_outage("Expecting ',' delimiter: line 1 column 1009") is False
+        assert ve.is_backend_outage(None) is False
+
+    def test_reason_taken_from_failed_batches_only(self):
+        batches = [
+            {"abnormal_event": False, "confidence": 0.1},
+            {"abnormal_event": None, "error": "claude CLI error: You've hit your limit"},
+            {"abnormal_event": None, "error": "claude CLI error: You've hit your limit"},
+        ]
+        assert "hit your limit" in ve.outage_reason(batches)
+
+    def test_no_outage_when_failures_are_local(self):
+        batches = [{"abnormal_event": None, "error": "JSON parse failed"}]
+        assert ve.outage_reason(batches) is None

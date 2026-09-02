@@ -144,6 +144,33 @@ instead of "invalid". `~/setup-claude-token.sh` now clears it first.
 Two quality issues surfaced by that first clean run (neither is a safety
 risk; both are open):
 
+## Alert storm during a quota outage (fixed 2026-09-02)
+
+Every motion event produced an "UNVERIFIED" Telegram alert for hours. The
+alerts were correct — the fail-open net doing its job — but the cause was
+a backend outage, not an event problem: `You've hit your limit · resets
+Sep 5` on 46 consecutive batches. During an outage every event fails
+identically, so per-event alerts add no information and train the owner to
+ignore the one channel that must never be ignored.
+
+Fix, in two pieces:
+
+- `verify_event.is_backend_outage()` separates backend-level failures
+  (quota, rate limit, 401/auth, overloaded) from event-level ones (a JSON
+  parse error stays event-level), and `analysis.json` carries
+  `backend_outage` with the shared reason.
+- `monitor.OutageNotifier` announces the outage **once**, then at most
+  every 6 h, and each notice reports how many events went unchecked
+  meanwhile. Recovery is announced once too. A positive verdict still
+  alerts immediately even mid-outage.
+
+**Root cause of the outage is cost, and it is not fixed.** Every batch
+escalates to the expensive confirm model because the screen tier returns
+`seen: "yes"` even on plainly normal footage (see the open item below), so
+~30 events/day x ~7 batches x 2 calls burns a Max quota window in hours.
+Until the screen tier actually filters, expect this to recur. The
+alert-storm fix makes recurrence tolerable, not absent.
+
 ## False alarms from undefined sign vocabulary (fixed 2026-08-23)
 
 Within two hours of verification coming back online the system sent two

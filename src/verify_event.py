@@ -115,6 +115,44 @@ def parse_json_verdict(text):
     return json.loads(m.group(0))
 
 
+# Failures that mean "the backend is unavailable right now" rather than
+# "this event could not be analyzed". They repeat on every event, so the
+# monitor announces them once instead of alerting per event.
+BACKEND_OUTAGE_MARKERS = (
+    "hit your limit",
+    "usage limit",
+    "rate limit",
+    "429",
+    "quota",
+    "overloaded",
+    "not logged in",
+    "token has expired",
+    "authenticate",
+)
+
+
+def is_backend_outage(error_text):
+    """True when an error means the whole backend is down, not this event."""
+    if not error_text:
+        return False
+    low = str(error_text).lower()
+    return any(m in low for m in BACKEND_OUTAGE_MARKERS)
+
+
+def outage_reason(batch_results):
+    """The shared outage reason across failed batches, or None."""
+    reasons = []
+    for r in batch_results:
+        if r.get("abnormal_event") is not None:
+            continue
+        err = r.get("error") or (r.get("screen_verdict") or {}).get("error")
+        if is_backend_outage(err):
+            reasons.append(str(err))
+    if not reasons:
+        return None
+    return max(set(reasons), key=reasons.count)[:200]
+
+
 def decide_signs(verdict):
     """Batch-level decision from a confirm verdict (recall-first rule layer)."""
     signs = verdict.get("observed_signs") or []
@@ -489,6 +527,7 @@ def main():
         "base_frames": len(list(base_dir.glob("frame_*.jpg"))),
         "burst_frames": len(list(burst_dir.glob("frame_*.jpg"))),
         "positive_batches": len(positive_conf),
+        "backend_outage": outage_reason(batch_results),
         "failed_batches": failed_batches,
         "final_reason": final_reason,
         "batches": batch_results,
