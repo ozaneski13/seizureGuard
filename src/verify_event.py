@@ -180,7 +180,9 @@ def should_escalate(screen_verdict):
     metadata (posture, a note) and escalates everything.
 
     Cost has to come from somewhere else: fewer frames per event, or a
-    stronger screen model, not from trusting this one's negatives."""
+    stronger screen model, not from trusting this one's negatives. (And
+    note the monitor shares its quota with the owner's interactive Claude
+    use — measured 2026-09-02, that is what emptied it, not this pipeline.)"""
     return True
 
 

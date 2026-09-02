@@ -201,12 +201,32 @@ Cost must come from somewhere that cannot cost recall:
   footage anyway)
 - a stronger screen model, which inverts the economics and is pointless
 
-**Root cause of the outage is cost, and it is not fixed.** Every batch
-escalates to the expensive confirm model because the screen tier returns
-`seen: "yes"` even on plainly normal footage (see the open item below), so
-~30 events/day x ~7 batches x 2 calls burns a Max quota window in hours.
-Until the screen tier actually filters, expect this to recur. The
-alert-storm fix makes recurrence tolerable, not absent.
+**Who actually exhausted the quota — measured, after an initial wrong
+call.** This log first blamed seizureGuard's own call volume. The event
+timeline says otherwise: on the day of the outage seizureGuard's last call
+was at 08:56 and the first `hit your limit` error came at 16:30, with
+**zero calls in between**. The quota went during those 7.5 hours, to the
+owner's interactive Claude use on the same subscription.
+
+The real structural issue is that **a 24/7 safety monitor shares one quota
+with interactive work**. Whoever spends it, the monitor is the one that
+goes blind, and it cannot ask for priority. seizureGuard's own footprint,
+for the record: ~20-55 events/day, ~130-380 batches, **~250-690 calls/day**
+(screen + confirm) — real, but not the thing that emptied the bucket that
+afternoon.
+
+Options, in order of how well they fit a monitor that must not go blind:
+
+1. **Give the monitor its own credential** — a separate subscription or an
+   API key with billing, so interactive work and the dog monitor cannot
+   starve each other. Costs money; needs a token estimate first (each call
+   carries 30 frames at 640 px).
+2. **Reduce the monitor's footprint** so it survives on the leftovers:
+   base sampling 2 fps -> 1 fps, motion-threshold calibration for the room.
+   Cheap, no recall cost, but does not remove the shared-fate problem.
+3. **Accept it**, now that an outage announces itself once instead of
+   spamming, and the owner knows to check when they have been hammering
+   Claude themselves.
 
 ## False alarms from undefined sign vocabulary (fixed 2026-08-23)
 
