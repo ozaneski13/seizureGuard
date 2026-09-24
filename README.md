@@ -253,6 +253,9 @@ ultralytics alone will replace them with CPU builds.)
   ExecStart=/usr/bin/python3 -u src/monitor.py --source rtsp://127.0.0.1:8554/dogcam_sub --name dogcam
   Restart=always
   RestartSec=10
+  # restart a monitor that wedges in native video code (it pings sd_notify)
+  WatchdogSec=300
+  NotifyAccess=main
 
   [Install]
   WantedBy=multi-user.target

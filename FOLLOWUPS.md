@@ -143,6 +143,33 @@ positives. **Follow-up:** measure the window from the newest event, or
 skip pruning when nothing new arrived, so a blind spell cannot empty the
 archive.
 
+**Why the monitors never recovered (found 2026-09-24, fixed in
+`3c82190`).** The camera drop-out was the trigger, not the reason the
+blindness lasted 20 days. When go2rtc answered 404, OpenCV, which had
+no backend pinned, fell back from FFMPEG to GStreamer. GStreamer leaked
+a pipeline per reconnect (`appsink6637` in the log) and deadlocked in
+native code: main thread in `futex_wait`, workers spinning at ~92% CPU,
+no log line after 2026-09-04 14:18, and zero go2rtc consumers even after
+the cameras returned. The monitors only came back when restarted.
+
+A repeated blind alert (the follow-up above) would not have caught this:
+it runs in the Python loop, and the Python loop never ran again. The
+fix has two layers:
+
+- stream URLs open with `cv2.CAP_FFMPEG` and 10 s open/read timeouts, so
+  a dead stream fails fast instead of falling back (verified on the Pi:
+  a 404 stream now fails in 0.0 s);
+- `SystemdWatchdog` pings `WATCHDOG=1`, and both monitor units carry a
+  drop-in `/etc/systemd/system/seizureguard-*.service.d/watchdog.conf`
+  with `WatchdogSec=300` + `NotifyAccess=main`. A process that wedges
+  anywhere in native code stops pinging and systemd restarts it within
+  five minutes. The window must stay above the slowest unpinged startup
+  path (auth check 30 s + verify probe 120 s); `handle_event` pings from
+  a keepalive thread because verify can take minutes.
+
+The repeated blind alert is still worth adding for the case the watchdog
+does not cover: a healthy loop staring at a stream that stays dead.
+
 ## Silent verification outage (found 2026-08-22, the project's worst bug)
 
 Every verify call on the Pi failed from the very first event (2026-08-09
