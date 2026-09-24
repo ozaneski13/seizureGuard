@@ -218,3 +218,6 @@ test_video.mp4
 runs/
 train.log
 *.pt
+# Dog-Pose dataset (~370 MB) that `yolo pose train data=dog-pose.yaml`
+# downloads next to the repo; re-downloadable, third-party licensed
+datasets/
