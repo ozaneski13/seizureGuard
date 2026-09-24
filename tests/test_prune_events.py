@@ -79,3 +79,107 @@ class TestPrune:
         os.utime(other, (old, old))
         prune_events.prune(tmp_path, keep_days=14)
         assert other.exists()
+
+
+def _neg(root, name, age_days, present=0, failed=0):
+    """A verified negative whose batches marked `present` signs as present."""
+    ev = root / name
+    ev.mkdir(parents=True)
+    (ev / "frame.jpg").write_bytes(b"x" * 1000)
+    signs = [{"sign": "paddling", "present": True}] * present
+    (ev / "analysis.json").write_text(json.dumps({
+        "final_abnormal_event": False, "failed_batches": failed,
+        "batches": [{"abnormal_event": False, "observed_signs": signs}],
+    }), encoding="utf-8")
+    old = time.time() - age_days * DAY
+    os.utime(ev, (old, old))
+    return ev
+
+
+class TestHardNegativeSamples:
+    def _fresh(self, root):
+        _event(root, "event_fresh", 0, positive=False)   # keeps the window at now
+
+    def test_one_negative_per_camera_per_day_is_kept(self, tmp_path):
+        self._fresh(tmp_path)
+        _neg(tmp_path, "event_20260801_100000_mi360-pi", 30)
+        _neg(tmp_path, "event_20260801_120000_mi360-pi", 30)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_20260801_120000_mi360-pi"]   # tie -> earliest kept
+
+    def test_most_sign_like_negative_is_the_sample(self, tmp_path):
+        self._fresh(tmp_path)
+        _neg(tmp_path, "event_20260801_100000_mi360-pi", 30, present=0)
+        _neg(tmp_path, "event_20260801_120000_mi360-pi", 30, present=2)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_20260801_100000_mi360-pi"]
+
+    def test_each_camera_and_day_gets_its_own_sample(self, tmp_path):
+        self._fresh(tmp_path)
+        for name in ("event_20260801_100000_mi360-pi", "event_20260801_110000_mi360-pi",
+                     "event_20260801_100000_c700-pi", "event_20260801_110000_c700-pi",
+                     "event_20260802_100000_mi360-pi", "event_20260802_110000_mi360-pi"):
+            _neg(tmp_path, name, 30)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert sorted(removed) == ["event_20260801_110000_c700-pi",
+                                   "event_20260801_110000_mi360-pi",
+                                   "event_20260802_110000_mi360-pi"]
+
+    def test_ambiguous_names_never_merge_two_slots(self, tmp_path):
+        # "_1_" may be monitor.py's collision suffix or part of a camera named
+        # "1_..."; merging would delete one camera's only hard negative.
+        self._fresh(tmp_path)
+        _neg(tmp_path, "event_20260801_100000_mi360-pi", 30)
+        _neg(tmp_path, "event_20260801_100000_1_mi360-pi", 30, present=1)
+        _neg(tmp_path, "event_20260801_110000_2_cam", 30)
+        _neg(tmp_path, "event_20260801_120000_cam", 30)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == []
+
+    def test_malformed_verdicts_never_stop_the_run(self, tmp_path):
+        # The claude-cli verifier stores observed_signs exactly as the model
+        # returned them; one odd shape inside the window must not abort every
+        # nightly prune (review finding, reproduced before the fix).
+        self._fresh(tmp_path)
+        shapes = [["none"], {"paddling": {"present": True}}, [None], "paddling", 7]
+        for i, signs in enumerate(shapes):
+            ev = tmp_path / f"event_202609{10 + i}_100000_odd-pi"
+            ev.mkdir()
+            (ev / "analysis.json").write_text(json.dumps({
+                "final_abnormal_event": False, "failed_batches": 0,
+                "batches": [{"abnormal_event": False, "observed_signs": signs}, "junk"],
+            }), encoding="utf-8")
+        weird = tmp_path / "event_20260920_100000_odd-pi"
+        weird.mkdir()
+        (weird / "analysis.json").write_text("null", encoding="utf-8")
+        for hour in ("10", "11", "12"):
+            _neg(tmp_path, f"event_20260801_{hour}0000_mi360-pi", 30)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_20260801_110000_mi360-pi",
+                           "event_20260801_120000_mi360-pi"]
+
+    def test_positive_does_not_take_the_negative_slot(self, tmp_path):
+        self._fresh(tmp_path)
+        _event(tmp_path, "event_20260801_090000_mi360-pi", 30, positive=True)
+        _neg(tmp_path, "event_20260801_100000_mi360-pi", 30)
+        _neg(tmp_path, "event_20260801_120000_mi360-pi", 30)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_20260801_120000_mi360-pi"]
+
+    def test_failed_or_unverified_events_are_never_samples(self, tmp_path):
+        self._fresh(tmp_path)
+        _neg(tmp_path, "event_20260801_100000_mi360-pi", 30, present=3, failed=2)
+        _neg(tmp_path, "event_20260801_120000_mi360-pi", 30)
+        _event(tmp_path, "event_20260802_100000_mi360-pi", 30, positive=None)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert sorted(removed) == ["event_20260801_100000_mi360-pi",
+                                   "event_20260802_100000_mi360-pi"]
+
+    def test_samples_are_stable_across_runs(self, tmp_path):
+        self._fresh(tmp_path)
+        for hour, present in (("10", 1), ("11", 0), ("12", 1), ("13", 0)):
+            _neg(tmp_path, f"event_20260801_{hour}0000_mi360-pi", 30, present=present)
+        first, _ = prune_events.prune(tmp_path, keep_days=14)
+        second, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert len(first) == 3 and second == []
+        assert (tmp_path / "event_20260801_100000_mi360-pi").exists()
