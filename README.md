@@ -76,19 +76,19 @@ The gate is strictly **fail-open**: no dog found, low confidence, spotty
 detections, or any error ⇒ the event escalates to verification anyway. The
 gate may only ever save money, never silently drop a seizure.
 
-### Step 4 — Two-tier AI verification
+### Step 4 — AI verification
 
-Frames go to a vision model in chronological batches of 30:
+Frames go to a strong vision model in chronological batches of 30. It
+assesses ten specific canine seizure signs — paddling, tonic stiffening,
+rhythmic jerking, jaw clonus, loss of posture, fencing posture, drooling,
+head tremor, muscle twitching, disorientation — each with body region and
+whether it was sustained, against written clinical definitions that spell
+out what each sign is *not* (lying down is not loss of posture; motion blur
+is not drooling).
 
-1. **Screen tier** (cheap model): "any sign of an abnormal motor event?" —
-   answers JSON `{"seen": yes/no, "confidence": 0..1, "posture": ...}`.
-   A batch escalates if the answer is yes, the confidence isn't near zero,
-   **or the dog is lying on its side** (the classic seizure posture — learned
-   from real footage where a cheap model misread a convulsion as normal).
-2. **Confirm tier** (strong model): assesses ten specific canine seizure
-   signs — paddling, tonic stiffening, rhythmic jerking, jaw clonus, loss of
-   posture, fencing posture, drooling, head tremor, muscle twitching,
-   disorientation — each with body region and whether it was sustained.
+There is deliberately no cheap pre-filter: a smaller model was measured
+answering "normal walking" on every batch of a real seizure, so its "no"
+carries no information (details in FOLLOWUPS.md).
 
 A deterministic rule layer decides per batch: **1 hard sign, or 2 any signs,
 or the model's own abnormal flag ⇒ positive.** The event-level decision is a
@@ -168,9 +168,9 @@ one "monitor blind" alert.
 1. Install [Claude Code](https://claude.com/claude-code).
 2. Run `claude` in a terminal once and log in with `/login`.
 
-That's it — the monitor auto-detects the login at startup. Screen tier uses
-`claude-haiku-4-5`, confirm tier `claude-fable-5` (an A/B test on real
-seizure footage showed weaker confirm models missing it — see FOLLOWUPS.md).
+That's it — the monitor auto-detects the login at startup and makes one
+real call to prove it works. Verification uses `claude-fable-5` (an A/B test
+on real seizure footage showed weaker models missing it — see FOLLOWUPS.md).
 
 **OpenAI (alternative):** set `SEIZUREGUARD_BACKEND=openai` and
 `OPENAI_API_KEY=<your key>`.
@@ -285,8 +285,8 @@ Watch the printed scores during normal activity, then adjust `MOTION_ON` /
 | Variable | Default | Purpose |
 |---|---|---|
 | `SEIZUREGUARD_BACKEND` | `claude-cli` | `claude-cli` or `openai` |
-| `SEIZUREGUARD_SCREEN_MODEL` | `claude-haiku-4-5` | cheap per-batch screen model |
-| `SEIZUREGUARD_CONFIRM_MODEL` | `claude-fable-5` | semiology confirm model |
+| `SEIZUREGUARD_PROBE_MODEL` | `claude-haiku-4-5` | cheap model for the one startup health-check call |
+| `SEIZUREGUARD_CONFIRM_MODEL` | `claude-fable-5` | verification model (seizure signs) |
 | `SEIZUREGUARD_MODEL` | `gpt-4.1-mini` | model for the openai backend |
 | `OPENAI_API_KEY` | — | required for the openai backend |
 | `SEIZUREGUARD_VERIFY` | auto | `0` disables AI verification, `1` forces it |

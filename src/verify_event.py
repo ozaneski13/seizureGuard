@@ -1,7 +1,7 @@
-"""Two-tier VLM verification of a captured event directory: a cheap screen
-model triages each 30-frame batch, positives escalate to a strong confirm
-model that assesses specific canine seizure signs; a deterministic rule
-layer decides, recall-first. Writes analysis.json into the event dir.
+"""VLM verification of a captured event directory: each 30-frame batch goes
+to the confirm model, which assesses specific canine seizure signs; a
+deterministic rule layer decides, recall-first. Writes analysis.json into
+the event dir.
 
 Usage: python src/verify_event.py <event_dir>
 """
@@ -16,7 +16,6 @@ import time
 from pathlib import Path
 
 BATCH_SIZE = 30
-SCREEN_ATTEMPTS = 1     # screen failure escalates anyway (fail-open)
 CONFIRM_ATTEMPTS = 2
 MAX_ATTEMPTS = CONFIRM_ATTEMPTS  # openai backend
 
@@ -75,7 +74,6 @@ VISION_CAUTIONS = (
 def get_config():
     return {
         "backend": os.environ.get("SEIZUREGUARD_BACKEND", "claude-cli"),
-        "screen_model": os.environ.get("SEIZUREGUARD_SCREEN_MODEL", "claude-haiku-4-5"),
         # A/B on the owner's real seizure recording (2026-08-09): sonnet-5
         # confirm called all 6 seizure batches normal; fable-5 flagged all 6
         # with hard signs. Confirm quality is what the alert rides on.
@@ -161,28 +159,6 @@ def decide_signs(verdict):
     return len(present) >= 2
 
 
-def should_escalate(screen_verdict):
-    """Screen tier gate — deliberately a near no-op, and here is why.
-
-    Measured on the owner's real seizure footage (2026-09-02): the cheap
-    screen model answered `abnormal_seen: "no"` on ALL SIX batches, with
-    notes like "normal purposeful walking", while the confirm model reading
-    the same frames reports paddling and loss of posture. The August A/B
-    said the same thing: haiku and sonnet called every seizure batch normal;
-    only fable flagged them.
-
-    So a "no" from this tier is not evidence of absence, and the tier cannot
-    be used to save money without dropping real seizures - two attempts to
-    make it filter both silenced the reference seizure. It stays as cheap
-    metadata (posture, a note) and escalates everything.
-
-    Cost has to come from somewhere else: fewer frames per event, or a
-    stronger screen model, not from trusting this one's negatives. (And
-    note the monitor shares its quota with the owner's interactive Claude
-    use — measured 2026-09-02, that is what emptied it, not this pipeline.)"""
-    return True
-
-
 # ------------------------------------------------------- claude-cli backend
 
 class ClaudeLoginError(RuntimeError):
@@ -202,39 +178,6 @@ SYSTEM_CONTRACT = (
 
 def _timestamps(paths):
     return ", ".join(f"{frame_time(p):.1f}" for p in paths)
-
-
-def screen_prompt(paths):
-    """Cheap triage tier.
-
-    The field used to be called "seen", which the model read as "did you see
-    the dog": it answered yes on plainly normal footage with confidence 0.05,
-    so every batch escalated to the expensive confirm model and burned the
-    quota. The question is now asked explicitly, in one sentence."""
-    return (
-        "You are screening frames from a dog monitoring camera. This is NOT "
-        "medical diagnosis.\n"
-        f"Frame timestamps in seconds (same order as the attached images): {_timestamps(paths)}\n"
-        "Frames are sampled at 2 fps normally and 10 fps during motion bursts, so gaps vary.\n"
-        + VISION_CAUTIONS +
-        "THE QUESTION: is an abnormal, INVOLUNTARY motor event (possible "
-        "epileptic seizure) visible in these frames?\n"
-        "Answer no for ordinary behaviour however vigorous it looks - walking, "
-        "running, playing, settling down, circling before lying down, "
-        "stretching, scratching, shaking off, sniffing, sleeping. Motion blur "
-        "means speed, not a seizure.\n"
-        "Answer yes for involuntary movement: a dog on its side with rapid "
-        "repetitive limb motion, legs giving way, thrashing without being able "
-        "to right itself, repetitive jerking, rigidly held limbs. If you truly "
-        "cannot tell, answer unsure - a miss costs far more than a second look.\n\n"
-        "Reply with exactly this JSON object and nothing else:\n"
-        '{"abnormal_seen": "yes" or "no" or "unsure", '
-        '"confidence": <number 0..1, informational only>, '
-        f'"posture": "<dominant posture, one of: {", ".join(POSTURES)}>", '
-        '"note": "<one short sentence>"}\n'
-        "If no dog is visible - wrong scene, empty room, synthetic imagery - that IS "
-        'a valid result: {"abnormal_seen": "no", "confidence": 0.0, "note": "no dog visible"}.'
-    )
 
 
 def confirm_prompt(paths):
@@ -340,24 +283,16 @@ def _with_retry(fn, batch_index, tier, attempts):
 
 
 def assess_batch_claude(event_dir, paths, config, batch_index):
-    """Screen with the cheap model; confirm positives with the strong model."""
-    screen, screen_error = _with_retry(
-        lambda: run_claude(screen_prompt(paths), config["screen_model"],
-                           images=paths, timeout=300),
-        batch_index, "screen", SCREEN_ATTEMPTS,
-    )
-    escalated = should_escalate(screen)
+    """Assess one batch with the confirm model.
 
-    if not escalated:
-        return {
-            "abnormal_event": False,
-            "confidence": float(screen.get("confidence", 0.0)),
-            "screen_verdict": screen,
-            "escalated": False,
-            "observed_signs": [],
-            "posture": screen.get("posture"),
-        }
-
+    Until 2026-09-24 a cheap screen model looked at every batch first. It
+    was measured blind to the owner's real seizure (haiku answered "no" on
+    all six batches, "normal purposeful walking"), and both attempts to let
+    it filter silenced that seizure, so its gate became a no-op. After that
+    it only cost an extra call per batch and supplied the note the event
+    viewer shows - a wrong explanation on exactly the events that matter.
+    Do not reintroduce a cheap pre-filter without re-running the reference
+    events in FOLLOWUPS. `screen_verdict` stays in analysis.json as None."""
     confirm, confirm_error = _with_retry(
         lambda: run_claude(confirm_prompt(paths), config["confirm_model"],
                            images=paths, timeout=600),
@@ -367,7 +302,7 @@ def assess_batch_claude(event_dir, paths, config, batch_index):
         return {
             "abnormal_event": None,
             "confidence": 0.0,
-            "screen_verdict": screen if screen is not None else {"error": screen_error},
+            "screen_verdict": None,
             "escalated": True,
             "observed_signs": [],
             "error": confirm_error,
@@ -375,11 +310,12 @@ def assess_batch_claude(event_dir, paths, config, batch_index):
     return {
         "abnormal_event": decide_signs(confirm),
         "confidence": float(confirm.get("confidence", 0.0)),
-        "screen_verdict": screen if screen is not None else {"error": screen_error},
+        "screen_verdict": None,
         "escalated": True,
         "observed_signs": confirm.get("observed_signs") or [],
         "posture": confirm.get("posture"),
         "partially_visible": confirm.get("partially_visible"),
+        "note": confirm.get("note"),
     }
 
 
@@ -539,7 +475,6 @@ def main():
         "final_abnormal_event": final,
         "final_confidence": max_conf,
         "backend": config["backend"],
-        "screen_model": config["screen_model"] if config["backend"] == "claude-cli" else None,
         "confirm_model": (config["confirm_model"] if config["backend"] == "claude-cli"
                           else config["openai_model"]),
         "batch_size": BATCH_SIZE,

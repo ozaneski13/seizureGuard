@@ -78,7 +78,9 @@ def peak_note(analysis):
             best, best_conf = b, c
     if not best:
         return ""
-    return ((best.get("screen_verdict") or {}).get("note") or "")[:300]
+    # confirm-model note; screen notes only exist in pre-2026-09-24 events
+    return (best.get("note")
+            or (best.get("screen_verdict") or {}).get("note") or "")[:300]
 
 
 def scan_events(root):

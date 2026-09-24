@@ -281,7 +281,7 @@ def verify_probe():
     exe = shutil.which("claude")
     if exe is None:
         return False, "claude CLI not found on PATH"
-    model = os.environ.get("SEIZUREGUARD_SCREEN_MODEL", "claude-haiku-4-5")
+    model = os.environ.get("SEIZUREGUARD_PROBE_MODEL", "claude-haiku-4-5")
     try:
         proc = subprocess.run(
             [exe, "-p", "--model", model, "--max-turns", "1",

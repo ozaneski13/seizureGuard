@@ -16,14 +16,8 @@ def _fast(monkeypatch):
     monkeypatch.setattr(ve.shutil, "which", lambda name: "claude")
 
 
-def _is_screen(prompt):
-    return "abnormal_seen" in prompt
-
-
-def _fake_run_claude(screen_fn, confirm_fn):
+def _fake_run_claude(confirm_fn):
     def fake(prompt, model, images, timeout=600):
-        if _is_screen(prompt):
-            return screen_fn(prompt)
         return confirm_fn(prompt)
     return fake
 
@@ -106,28 +100,6 @@ class TestSignRules:
         assert ve.decide_signs({}) is False
 
 
-class TestScreenGate:
-    """The gate escalates everything on purpose: measured on real seizure
-    footage, the cheap tier answers "no" on every batch of an actual
-    seizure, so its negatives carry no information."""
-
-    def test_clear_no_still_escalates(self):
-        assert ve.should_escalate({"abnormal_seen": "no", "confidence": 0.05}) is True
-
-    def test_high_self_certainty_on_a_no_still_escalates(self):
-        assert ve.should_escalate({"abnormal_seen": "no", "confidence": 0.95}) is True
-
-    def test_yes_escalates(self):
-        assert ve.should_escalate({"abnormal_seen": "yes", "confidence": 0.05}) is True
-
-    def test_failed_screen_escalates(self):
-        assert ve.should_escalate(None) is True
-
-    def test_lateral_recumbency_escalates(self):
-        assert ve.should_escalate(
-            {"abnormal_seen": "no", "posture": "lying_lateral"}) is True
-
-
 class TestRunClaude:
     def _proc(self, stdout, returncode=0):
         return types.SimpleNamespace(stdout=stdout, stderr="", returncode=returncode)
@@ -188,30 +160,23 @@ class TestRunClaude:
 
 
 class TestClaudeBackendFlow:
-    def test_screen_negative_still_reaches_confirm(self, monkeypatch, tmp_path):
-        """A screen "no" carries no information on real seizure footage, so
-        the confirm model must see the frames anyway."""
+    def test_each_batch_makes_exactly_one_confirm_call(self, monkeypatch, tmp_path):
+        """The screen tier is gone: its negatives were measured to carry no
+        information, so it only cost a call per batch."""
         calls = []
 
         def fake(prompt, model, images, timeout=600):
             calls.append(model)
-            if _is_screen(prompt):
-                return {"abnormal_seen": "no", "confidence": 0.05}
             return {"abnormal_event": False, "confidence": 0.1, "observed_signs": []}
 
         monkeypatch.setattr(ve, "run_claude", fake)
         r = ve.assess_batch_claude(tmp_path, [], ve.get_config(), 1)
         assert r["abnormal_event"] is False
-        assert r["escalated"] is True
-        assert calls == ["claude-haiku-4-5", "claude-fable-5"]
+        assert calls == ["claude-fable-5"]
+        assert r["screen_verdict"] is None
 
-    def test_positive_screen_escalates_to_confirm(self, monkeypatch, tmp_path):
-        models = []
-
+    def test_positive_confirm_marks_batch(self, monkeypatch, tmp_path):
         def fake(prompt, model, images, timeout=600):
-            models.append(model)
-            if _is_screen(prompt):
-                return {"seen": "yes", "confidence": 0.8}
             return {"abnormal_event": True, "confidence": 0.9,
                     "observed_signs": [{"sign": "paddling", "present": True,
                                         "body_region": "legs", "sustained": True}]}
@@ -219,38 +184,23 @@ class TestClaudeBackendFlow:
         monkeypatch.setattr(ve, "run_claude", fake)
         r = ve.assess_batch_claude(tmp_path, [], ve.get_config(), 1)
         assert r["abnormal_event"] is True
-        assert r["escalated"] is True
-        assert models == ["claude-haiku-4-5", "claude-fable-5"]
 
-    def test_lateral_posture_reaches_confirm_and_is_recorded(self, monkeypatch, tmp_path):
+    def test_confirm_posture_and_note_are_recorded(self, monkeypatch, tmp_path):
+        """The event viewer shows this note; it used to come from the blind
+        screen model and read "normal walking" on a real seizure."""
         def fake(prompt, model, images, timeout=600):
-            if _is_screen(prompt):
-                return {"seen": "no", "confidence": 0.05, "posture": "lying_lateral"}
             return {"abnormal_event": False, "confidence": 0.2,
                     "posture": "lying_lateral", "partially_visible": True,
-                    "observed_signs": []}
+                    "observed_signs": [], "note": "dog on its side, still"}
 
         monkeypatch.setattr(ve, "run_claude", fake)
         r = ve.assess_batch_claude(tmp_path, [], ve.get_config(), 1)
-        assert r["escalated"] is True
         assert r["posture"] == "lying_lateral"
         assert r["partially_visible"] is True
-
-    def test_screen_failure_fails_open_to_confirm(self, monkeypatch, tmp_path):
-        def fake(prompt, model, images, timeout=600):
-            if _is_screen(prompt):
-                raise RuntimeError("boom")
-            return {"abnormal_event": False, "confidence": 0.1, "observed_signs": []}
-
-        monkeypatch.setattr(ve, "run_claude", fake)
-        r = ve.assess_batch_claude(tmp_path, [], ve.get_config(), 1)
-        assert r["escalated"] is True
-        assert r["abnormal_event"] is False
+        assert r["note"] == "dog on its side, still"
 
     def test_confirm_failure_marks_batch_failed(self, monkeypatch, tmp_path):
         def fake(prompt, model, images, timeout=600):
-            if _is_screen(prompt):
-                return {"seen": "yes", "confidence": 0.9}
             raise RuntimeError("confirm down")
 
         monkeypatch.setattr(ve, "run_claude", fake)
@@ -269,27 +219,23 @@ class TestClaudeBackendFlow:
 
 class TestEndToEnd:
     def test_early_true_survives_later_quiet_batches(self, monkeypatch, synthetic_event_dir):
-        def screen(prompt):
-            hit = _prompt_hits_window(prompt, 20.0, 23.0)
-            return {"seen": "yes" if hit else "no", "confidence": 0.9 if hit else 0.05}
-
         def confirm(prompt):
-            return {"abnormal_event": True, "confidence": 0.9,
-                    "observed_signs": [{"sign": "rhythmic_jerking", "present": True,
-                                        "body_region": "whole body", "sustained": True}]}
+            if _prompt_hits_window(prompt, 20.0, 23.0):
+                return {"abnormal_event": True, "confidence": 0.9,
+                        "observed_signs": [{"sign": "rhythmic_jerking", "present": True,
+                                            "body_region": "whole body", "sustained": True}]}
+            return {"abnormal_event": False, "confidence": 0.1, "observed_signs": []}
 
-        monkeypatch.setattr(ve, "run_claude", _fake_run_claude(screen, confirm))
+        monkeypatch.setattr(ve, "run_claude", _fake_run_claude(confirm))
         out = _run_main(monkeypatch, synthetic_event_dir)
         assert out["final_abnormal_event"] is True
         assert out["failed_batches"] == 0
-        assert all(b["escalated"] for b in out["batches"])   # gate is a no-op
+        assert 1 <= out["positive_batches"] < len(out["batches"])
 
     def test_all_negative_stays_negative(self, monkeypatch, synthetic_event_dir):
         monkeypatch.setattr(ve, "run_claude", _fake_run_claude(
-            lambda p: {"abnormal_seen": "no", "confidence": 0.05},
             lambda p: {"abnormal_event": False, "confidence": 0.1,
-                       "observed_signs": []},
-        ))
+                       "observed_signs": []}))
         out = _run_main(monkeypatch, synthetic_event_dir)
         assert out["final_abnormal_event"] is False
         assert out["failed_batches"] == 0
@@ -300,8 +246,7 @@ class TestEndToEnd:
                 raise RuntimeError("simulated failure")
             return {"abnormal_event": False, "confidence": 0.1, "observed_signs": []}
 
-        monkeypatch.setattr(ve, "run_claude", _fake_run_claude(
-            lambda p: {"abnormal_seen": "unsure", "confidence": 0.5}, confirm))
+        monkeypatch.setattr(ve, "run_claude", _fake_run_claude(confirm))
         out = _run_main(monkeypatch, synthetic_event_dir)
         assert out["failed_batches"] >= 1
         assert out["final_abnormal_event"] is False
@@ -309,12 +254,11 @@ class TestEndToEnd:
 
     def test_analysis_json_contract(self, monkeypatch, synthetic_event_dir):
         monkeypatch.setattr(ve, "run_claude", _fake_run_claude(
-            lambda p: {"abnormal_seen": "no", "confidence": 0.05},
             lambda p: {"abnormal_event": False, "confidence": 0.1,
                        "observed_signs": []}))
         out = _run_main(monkeypatch, synthetic_event_dir)
         for key in ("final_abnormal_event", "final_confidence", "backend",
-                    "screen_model", "confirm_model", "batch_size", "num_frames",
+                    "confirm_model", "batch_size", "num_frames",
                     "base_frames", "burst_frames", "failed_batches",
                     "final_reason", "batches"):
             assert key in out
@@ -341,8 +285,6 @@ class TestConfidenceSemantics:
         seq = list(verdicts)
 
         def fake(prompt, model, images, timeout=600):
-            if _is_screen(prompt):
-                return {"seen": "yes", "confidence": 0.9}
             return seq.pop(0) if seq else {
                 "abnormal_event": False, "confidence": 0.1, "observed_signs": []}
 
@@ -411,25 +353,3 @@ class TestBackendOutageClassification:
     def test_no_outage_when_failures_are_local(self):
         batches = [{"abnormal_event": None, "error": "JSON parse failed"}]
         assert ve.outage_reason(batches) is None
-
-
-class TestScreenTierAsksTheRightQuestion:
-    """The old field name ("seen") was read as 'did you see the dog': the
-    model answered yes on normal footage with confidence 0.05, so every
-    batch escalated to the expensive model and exhausted the quota."""
-
-    def test_question_is_explicit(self):
-        prompt = ve.screen_prompt([])
-        assert "THE QUESTION" in prompt
-        assert "INVOLUNTARY" in prompt
-        assert "abnormal_seen" in prompt
-
-    def test_prompt_lists_ordinary_behaviour_as_no(self):
-        prompt = ve.screen_prompt([])
-        for behaviour in ("walking", "settling down", "scratching", "sniffing"):
-            assert behaviour in prompt
-        assert "Motion blur" in prompt
-
-    def test_prompt_keeps_the_recall_tiebreak(self):
-        assert "cannot tell, answer unsure" in ve.screen_prompt([])
-
