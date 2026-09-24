@@ -45,12 +45,31 @@ Open items and next steps, ordered by value. Status as of 2026-08-09.
   non-rhythmic events. Improvement path: per-dog threshold calibration on
   captured events, and phase-coherence features (seizure clonus is
   phase-locked across limbs; gait alternates) to widen the separation.
+  **Measured 2026-09-25 on the 4 surviving real events (Pi 5, CPU):**
+  mean_conf 0.35 / 0.41 / 0.39, above the 0.30 fail-open floor. Detection
+  was 81% and 97% on the two walking false alarms and 32% on the seizure
+  clip, where the gate failed open and the event escalated. FA2 would have
+  been skipped (score 0.40 < 0.45), and the 08-30 event failed open because
+  the dog was too small to detect. Cost is 25-39 s per event. **Decision:
+  the gate stays OFF.** A skip means the event is never verified. The only
+  real seizure got past the gate only by failing open, and the verifier
+  catches it on a single 3 s burst (batch 2). If wanted later, the next
+  step is a log-only mode: it records the gate's decision after
+  verification and never skips. The prepared venv stays on the Pi
+  (`~/seizureGuard/.venv-pose`, 5.7 GB, mostly unused CUDA wheels, plus
+  `models/dog-pose.pt`); `rm -rf` both to reclaim the space.
 - **Collect hard negatives.** Play, scratching, shaking off water — save event
   dirs the monitor captures during normal life; they become the false-positive
   regression set (AnomalyRuler-style normality rules are the follow-on idea,
   see DATASETS.md rec #2). The public eval corpus already covers play,
   scratch-reflex, and sleep-twitching negatives (EVAL.md); what's missing is
   *this* dog in *this* room.
+  **Automated (2026-09-25):** `prune_events.py` now keeps one verified
+  negative per camera per day forever. It keeps the one whose batches mark
+  the most observed signs present (ties go to the earliest). Events with
+  failed batches or no verdict never qualify. That is about 2 events a day,
+  roughly 15 GB a year. The 129 negatives lost in the 2026-09 blind spell
+  predate this rule.
 
 ## 24/7 operation — production on the Pi 5 (since 2026-08-09 evening)
 
@@ -95,9 +114,9 @@ Standing constraints:
   `--no-session-persistence` (regression-tested) and the old transcripts
   deleted. (2) `data/events/` grows ~30 events/day (~3 GB/8 days);
   `scripts/prune_events.py` now runs daily (`seizureguard-prune.timer`,
-  04:20): keeps the 14 days before the newest event plus **every
-  verifier-positive event forever** (training set), deletes older
-  negatives.
+  04:20): keeps the 14 days before the newest event, **every
+  verifier-positive event forever** (training set), and one hard-negative
+  sample per camera per day forever; deletes the other older negatives.
 - **CORRECTION — there is no live false-alarm figure yet.** An earlier
   note here read the ~230 captured events' `final_abnormal_event: false`
   as "the verifier rejected them". It did not: `failed_batches` equalled
@@ -352,6 +371,29 @@ Watch item: the true positive's margin narrowed from 6/6 to 2/6 positive
 batches. It still fires (the event rule is a pure OR), and separation from
 the negatives is clean, but a subtler seizure has less headroom than
 before. Re-check this table whenever the prompt changes.
+
+**Re-check 2026-09-25**, after the screen tier was dropped. The confirm
+prompt was unchanged. Runs were on copies on the Pi, with the production
+token:
+
+| Event | Runs | Result |
+|---|---|---|
+| Walking dog (false alarm 1) | 1 | silent 0/7 |
+| Walking dog (false alarm 2) | 1 | silent 0/7 |
+| Real seizure (owner footage) | 5 | **ALERT in 5/5**, always 1/6, always the same batch |
+| Same seizure in grayscale (IR stand-in) | 3 | **ALERT in 3/3**, 1-2/6 |
+
+Run to run, the detection is stable. But it rests on a single window:
+batch 2, the 10 fps motion burst in which the dog lies on its side with
+rapid limb motion for ~3 s "without rising". Every other batch is judged
+voluntary rolling because the dog "repeatedly rights itself". So the thin
+margin is not a coin flip. It is one structural point of failure: if a
+seizure's burst window is shorter, cropped, or broken by a head lift, no
+batch would come back positive. Grayscale did not hurt (it flagged as
+often or more). Real IR footage, with its noise and lower contrast, is
+still unmeasured. In one grayscale run a batch was lost to malformed
+model JSON, which failed both attempts ("Expecting ',' delimiter"). The
+event still alerted from its other batches.
 
 Also fixed in the same pass: `final_confidence` is now the confidence of
 the *finding* (max over positive batches) instead of the max over all
