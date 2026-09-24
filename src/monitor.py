@@ -6,6 +6,7 @@ Usage: python src/monitor.py --source <index|file|rtsp url> [--name cam]
 """
 import argparse
 import contextlib
+import faulthandler
 import json
 import os
 import re
@@ -633,6 +634,10 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
 def main():
     if sys.stdout and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
+    # systemd's watchdog kills a wedged monitor with SIGABRT; this makes that
+    # kill print every thread's stack to the journal, so the next wedge can be
+    # diagnosed from its stack instead of guessed.
+    faulthandler.enable()
     parser = argparse.ArgumentParser(description="seizureGuard continuous monitor")
     parser.add_argument("--source", default="0",
                         help="camera index (default 0) or video file path")
