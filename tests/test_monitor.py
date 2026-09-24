@@ -53,12 +53,20 @@ class _FakeCap:
 
 
 class TestOpenCaptureSources:
-    def test_url_source_passes_string_through(self, monkeypatch):
+    def test_url_source_forces_ffmpeg_with_timeouts(self, monkeypatch):
+        """Regression (2026-09-04): with no backend pinned, a 404 from the
+        restreamer made OpenCV fall back to GStreamer, which deadlocked in
+        native code and left the monitor blind for 20 days."""
         created = []
         monkeypatch.setattr(monitor.cv2, "VideoCapture",
                             lambda *a: created.append(_FakeCap(*a)) or created[-1])
         cap, file_mode, fps = monitor.open_capture("rtsp://localhost:8554/mi360")
-        assert created[0].args == ("rtsp://localhost:8554/mi360",)
+        url, backend, params = created[0].args
+        assert url == "rtsp://localhost:8554/mi360"
+        assert backend == monitor.cv2.CAP_FFMPEG
+        settings = dict(zip(params[::2], params[1::2]))
+        assert settings[monitor.cv2.CAP_PROP_OPEN_TIMEOUT_MSEC] > 0
+        assert settings[monitor.cv2.CAP_PROP_READ_TIMEOUT_MSEC] > 0
         assert file_mode is False
         assert fps is None
 
@@ -320,3 +328,53 @@ class TestOutageIsNotAPerEventAlert:
                    "positive_batches": 2, "failed_batches": 3,
                    "batches": [{}] * 7, "backend_outage": "limit"}
         assert "Abnormal" in monitor.alert_text_for(verdict, "ev")
+
+
+
+class TestSystemdWatchdog:
+    """The monitor once wedged in native code for 20 days while systemd said
+    "active"; only an external watchdog can catch that, so pinging must be
+    reliable when enabled and inert when not."""
+
+    def _wd(self, monkeypatch, addr="/run/systemd/notify", interval=10.0):
+        if addr is None:
+            monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+        else:
+            monkeypatch.setenv("NOTIFY_SOCKET", addr)
+        wd = monitor.SystemdWatchdog(interval=interval)
+        sent = []
+        monkeypatch.setattr(wd, "_send", lambda msg: sent.append(msg))
+        return wd, sent
+
+    def test_noop_without_notify_socket(self, monkeypatch):
+        wd, sent = self._wd(monkeypatch, addr=None)
+        assert wd.ping(100.0) is False
+        with wd.keepalive():
+            pass
+        assert sent == []
+
+    def test_first_ping_sends_watchdog_message(self, monkeypatch):
+        wd, sent = self._wd(monkeypatch)
+        assert wd.ping(100.0) is True
+        assert sent == [b"WATCHDOG=1"]
+
+    def test_pings_are_rate_limited(self, monkeypatch):
+        wd, sent = self._wd(monkeypatch, interval=10.0)
+        wd.ping(100.0)
+        assert wd.ping(105.0) is False
+        assert wd.ping(110.5) is True
+        assert len(sent) == 2
+
+    def test_abstract_socket_address(self, monkeypatch):
+        wd, _ = self._wd(monkeypatch, addr="@/org/freedesktop/systemd1/notify")
+        assert wd._address() == chr(0) + "/org/freedesktop/systemd1/notify"
+
+    def test_keepalive_pings_while_main_loop_is_blocked(self, monkeypatch):
+        import time as _time
+        wd, sent = self._wd(monkeypatch, interval=0.02)
+        with wd.keepalive():
+            _time.sleep(0.15)
+        assert len(sent) >= 2
+        count = len(sent)
+        _time.sleep(0.08)
+        assert len(sent) == count          # thread stopped with the block

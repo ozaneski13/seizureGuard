@@ -5,12 +5,15 @@ through the pose gate and VLM verification before alerting.
 Usage: python src/monitor.py --source <index|file|rtsp url> [--name cam]
 """
 import argparse
+import contextlib
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -45,6 +48,9 @@ PRE_ROLL_SEC = 5.0           # context saved from before the trigger
 # Live-stream health (camera index or RTSP/HTTP URL sources)
 STREAM_RETRY_SEC = 3.0       # sustained read failure before a reconnect attempt
 STREAM_BLIND_ALERT_SEC = 60.0  # still dead after this long -> one alert
+STREAM_OPEN_TIMEOUT_MS = 10000   # FFMPEG open/read timeouts: a dead stream
+STREAM_READ_TIMEOUT_MS = 10000   # must fail fast, never block the loop
+WATCHDOG_PING_SEC = 10.0         # systemd WatchdogSec must be well above this
 
 
 class RingBuffer:
@@ -182,6 +188,64 @@ class StreamWatchdog:
             self.alerted = True
             actions.append("blind_alert")
         return actions
+
+
+class SystemdWatchdog:
+    """Pings systemd's service watchdog (sd_notify "WATCHDOG=1").
+
+    On 2026-09-04 the monitor wedged inside native video code and stayed
+    wedged for 20 days: Python never ran again, so no in-process check could
+    fire, while systemd kept reporting the unit "active". With WatchdogSec=
+    on the unit, systemd restarts a process that stops pinging. No-op when
+    NOTIFY_SOCKET is unset (Windows, tests, units without WatchdogSec)."""
+
+    def __init__(self, interval=WATCHDOG_PING_SEC):
+        self.addr = os.environ.get("NOTIFY_SOCKET")
+        self.interval = interval
+        self.last = None
+
+    def ping(self, now):
+        """Rate-limited ping from the main loop. Returns True when sent."""
+        if not self.addr:
+            return False
+        if self.last is not None and now - self.last < self.interval:
+            return False
+        self.last = now
+        self._send(b"WATCHDOG=1")
+        return True
+
+    def _address(self):
+        # "@name" is the abstract-namespace form systemd uses
+        return chr(0) + self.addr[1:] if self.addr.startswith("@") else self.addr
+
+    def _send(self, message):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.sendto(message, self._address())
+        except OSError:
+            pass
+
+    @contextlib.contextmanager
+    def keepalive(self):
+        """Keep pinging from a thread while the main loop is blocked in
+        handle_event; every wait inside it (pose gate, verify, Telegram)
+        carries its own timeout, so this cannot mask a wedge forever."""
+        if not self.addr:
+            yield
+            return
+        stop = threading.Event()
+
+        def beat():
+            while not stop.wait(self.interval):
+                self._send(b"WATCHDOG=1")
+
+        thread = threading.Thread(target=beat, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=2)
 
 
 # ---------------------------------------------------------------- pipeline
@@ -405,18 +469,28 @@ def open_capture(source):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
         fps, file_mode = None, False
     else:
-        cap = cv2.VideoCapture(src)   # stream URL (rtsp://, http://), wall-clock
+        # Stream URL (rtsp://, http://), wall-clock. FFMPEG is forced: when
+        # the restreamer answered 404, OpenCV silently fell back to
+        # GStreamer, which leaked a pipeline per reconnect and deadlocked in
+        # native code (2026-09-04, 20 days blind). Bounded timeouts make a
+        # dead stream fail fast so StreamWatchdog can do its job.
+        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, STREAM_OPEN_TIMEOUT_MS,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, STREAM_READ_TIMEOUT_MS,
+        ])
         fps, file_mode = None, False
     if not cap.isOpened():
         raise RuntimeError(f"Could not open source: {source}")
     return cap, file_mode, fps
 
 
-def _open_live(source):
+def _open_live(source, systemd_watchdog=None):
     """Open a live source, retrying forever — at boot the restreamer may not
     be up yet, and a monitor that dies on a slow dependency never watches."""
     watchdog = StreamWatchdog()
     while True:
+        if systemd_watchdog is not None:
+            systemd_watchdog.ping(time.monotonic())
         try:
             return open_capture(source)
         except RuntimeError as e:
@@ -428,10 +502,11 @@ def _open_live(source):
 
 
 def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
+    systemd_watchdog = SystemdWatchdog()
     if Path(str(source)).exists():
         cap, file_mode, fps = open_capture(source)
     else:
-        cap, file_mode, fps = _open_live(source)
+        cap, file_mode, fps = _open_live(source, systemd_watchdog)
     use_verify = verify_enabled()
     print(f"✅ Monitoring {'file' if file_mode else 'camera'} {source} "
           f"(verify: {'on' if use_verify else 'off'})")
@@ -455,6 +530,7 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
     last_ring_t = None
 
     while True:
+        systemd_watchdog.ping(time.monotonic())
         ret, frame = cap.read()
         if not ret:
             if file_mode:
@@ -505,15 +581,17 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
 
         ev = trigger.feed(t, score, glob)
         if ev is not None:
-            done = handle_event(ring, motion_history, ev[0], ev[1], out_root,
-                                use_verify, name, outage_notifier)
+            with systemd_watchdog.keepalive():
+                done = handle_event(ring, motion_history, ev[0], ev[1], out_root,
+                                    use_verify, name, outage_notifier)
             if done is not None:
                 events.append(done)
 
     ev = trigger.flush()
     if ev is not None:
-        done = handle_event(ring, motion_history, ev[0], ev[1], out_root,
-                            use_verify, name, outage_notifier)
+        with systemd_watchdog.keepalive():
+            done = handle_event(ring, motion_history, ev[0], ev[1], out_root,
+                                use_verify, name, outage_notifier)
         if done is not None:
             events.append(done)
 
