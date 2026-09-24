@@ -101,6 +101,47 @@ Standing constraints:
   note here read the ~230 captured events' `final_abnormal_event: false`
   as "the verifier rejected them". It did not: `failed_batches` equalled
   the batch count on every one. See the outage below.
+- **Event archive viewer (2026-09-14):** `seizureguard-events.service`
+  serves `src/event_server.py` on port 8090 (all interfaces, LAN only,
+  **no auth** — anyone on the home network can watch the clips). Grid of
+  captured events with thumbnail, date/time, camera, verdict badge and
+  `final_confidence`; the detail page plays `event.mp4` with HTTP Range
+  (seeking works) and lists the observed signs. Default order is
+  positives first, because `final_confidence` is the verifier's
+  confidence in its own verdict — a raw confidence sort puts a 0.96
+  *negative* on top. Thumbnails are cached in `data/thumbs/` and dropped
+  once their event is pruned. `scripts/deploy-pi.ps1` ships and restarts
+  it.
+- **The SD card still holds a bootable pre-NVMe copy** (frozen
+  2026-08-22). `BOOT_ORDER=0x416` falls back to it if the NVMe fails, and
+  it would then run that old seizureGuard code without any warning.
+  Remove the card or make the boot order NVMe-only once the NVMe is
+  trusted.
+
+## Blind for 20 days (2026-09-04 → 2026-09-24)
+
+Both cameras dropped off the Wi-Fi at 2026-09-04 14:44. The Xiaomi cloud
+reported `device offline` for both while their 2.4 GHz SSID stayed up,
+so the fault was on the camera side. Every go2rtc stream — main and
+`_sub` alike — failed with `read udp ... i/o timeout`, both monitors
+hung in their reconnect path, and nothing was captured. The cameras were
+back on the network by 2026-09-24 and the monitors were restarted that
+evening; both report `Monitoring camera ... (verify: on)` again.
+
+Two detection gaps let it run for 20 days:
+
+- `systemctl is-active` kept answering `active` while both monitors had
+  stopped logging entirely. "Active" is not "watching".
+- The "monitor blind" alert fires once (it did, on 2026-09-04) and never
+  repeats. **Follow-up:** repeat it on a schedule while the stream stays
+  down, the way `OutageNotifier` repeats backend outages.
+
+And one data loss: `prune_events.py` keeps "the last 14 days" measured
+from *now*. With nothing new arriving, it deleted every negative from
+before the outage (129 events, 2026-09-15..18), leaving only the 4
+positives. **Follow-up:** measure the window from the newest event, or
+skip pruning when nothing new arrived, so a blind spell cannot empty the
+archive.
 
 ## Silent verification outage (found 2026-08-22, the project's worst bug)
 
