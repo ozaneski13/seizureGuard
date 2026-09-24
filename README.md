@@ -159,7 +159,8 @@ python src/monitor.py --source rtsp://127.0.0.1:8554/dogcam_sub
 Tips learned the hard way: prefer the low-res substream (`subtype=1`) —
 it's the pipeline's working resolution and decodes almost for free; dropped
 streams reconnect automatically; if the stream stays dead for 60 s you get
-one "monitor blind" alert.
+a "monitor blind" alert, repeated every 6 h while it stays dead, and a
+"monitor recovered" message when frames return.
 
 ### Step 2 — Connect the AI (choose one backend)
 

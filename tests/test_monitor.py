@@ -24,20 +24,74 @@ class TestStreamWatchdog:
         assert wd.failed(103.9) == []          # just retried; wait
         assert wd.failed(107.0) == ["reconnect"]
 
-    def test_blind_alert_fires_exactly_once(self):
+    def test_blind_alert_fires_once_per_reminder_interval(self):
+        wd = StreamWatchdog(retry_sec=3.0, alert_sec=60.0, remind_sec=3600.0)
+        wd.failed(100.0)
+        assert "blind_alert" in wd.failed(161.0)
+        assert "blind_alert" not in wd.failed(300.0)
+
+    def test_blind_alert_repeats_while_the_stream_stays_dead(self):
+        """Regression (2026-09): one alert on day one of a 20-day blind
+        spell was all the owner got."""
+        wd = StreamWatchdog(retry_sec=3.0, alert_sec=60.0, remind_sec=3600.0)
+        wd.failed(100.0)
+        wd.failed(161.0)
+        assert "blind_alert" not in wd.failed(3700.0)
+        assert "blind_alert" in wd.failed(3761.0)
+        assert "blind_alert" in wd.failed(7361.0)
+
+    def test_recovery_after_alert_reports_how_long_it_was_down(self):
         wd = StreamWatchdog(retry_sec=3.0, alert_sec=60.0)
         wd.failed(100.0)
-        actions = wd.failed(161.0)
-        assert "blind_alert" in actions
-        assert "blind_alert" not in wd.failed(300.0)
+        wd.failed(161.0)
+        assert wd.ok(400.0) == 300.0
+
+    def test_recovery_before_alert_is_silent(self):
+        wd = StreamWatchdog(retry_sec=3.0, alert_sec=60.0)
+        wd.failed(100.0)
+        assert wd.ok(130.0) is None
+        assert wd.ok(131.0) is None            # healthy reads stay silent
 
     def test_recovery_resets_everything(self):
         wd = StreamWatchdog(retry_sec=3.0, alert_sec=60.0)
         wd.failed(100.0)
         wd.failed(161.0)
-        wd.ok()
+        wd.ok(170.0)
         assert wd.failed(200.0) == []          # fresh stall, fresh timers
         assert wd.failed(204.0) == ["reconnect"]
+
+
+class TestFormatDuration:
+    def test_units(self):
+        assert monitor.format_duration(30) == "1 min"
+        assert monitor.format_duration(61) == "1 min"
+        assert monitor.format_duration(45 * 60) == "45 min"
+        assert monitor.format_duration(6 * 3600) == "6.0 h"
+        assert monitor.format_duration(20 * 86400) == "20.0 days"
+
+
+class TestOpenLiveAlerts:
+    def test_cannot_open_repeats_then_announces_recovery(self, monkeypatch):
+        clock = [1000.0]
+        sent = []
+        attempts = []
+
+        def fake_open(source):
+            attempts.append(clock[0])
+            if clock[0] < 1000.0 + 7 * 3600:
+                raise RuntimeError("Could not open source")
+            return ("cap", False, None)
+
+        monkeypatch.setattr(monitor, "open_capture", fake_open)
+        monkeypatch.setattr(monitor.time, "time", lambda: clock[0])
+        monkeypatch.setattr(monitor.time, "sleep",
+                            lambda s: clock.__setitem__(0, clock[0] + 600))
+        monkeypatch.setattr(monitor.alerts, "send_alert", sent.append)
+
+        assert monitor._open_live("rtsp://x/mi360") == ("cap", False, None)
+        blind = [m for m in sent if m.startswith("Monitor cannot open")]
+        assert len(blind) == 2                 # at ~10 min and ~6 h 10 min
+        assert sent[-1].startswith("Monitor recovered: rtsp://x/mi360 opened after 7.0 h")
 
 
 class _FakeCap:

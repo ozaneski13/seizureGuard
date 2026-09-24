@@ -1,6 +1,7 @@
-"""Disk hygiene for data/events: keep every event from the last N days,
-and forever keep events the verifier flagged positive (they are the future
-training set); delete older negatives. Never touches anything else.
+"""Disk hygiene for data/events: keep every event from the N days before
+the newest event, and forever keep events the verifier flagged positive
+(they are the future training set); delete older negatives. Never touches
+anything else.
 
 Usage: python scripts/prune_events.py [--root data/events] [--keep-days 14] [--dry-run]
 """
@@ -28,11 +29,20 @@ def dir_size(path):
 
 
 def prune(root, keep_days, dry_run=False, now=None):
+    """The window is measured back from the newest event, not from now.
+    While the monitor is blind no new events arrive, and a now-based window
+    kept eating the archive anyway: it deleted 129 negatives during the
+    2026-09 blind spell. min(now, ...) keeps a future-dated event (clock
+    jump) from sliding the window forward."""
     now = time.time() if now is None else now
-    cutoff = now - keep_days * 86400
+    events = [ev for ev in sorted(Path(root).glob("event_*")) if ev.is_dir()]
+    if not events:
+        return [], 0
+    newest = min(now, max(ev.stat().st_mtime for ev in events))
+    cutoff = newest - keep_days * 86400
     removed, freed = [], 0
-    for ev in sorted(Path(root).glob("event_*")):
-        if not ev.is_dir() or ev.stat().st_mtime >= cutoff or is_positive(ev):
+    for ev in events:
+        if ev.stat().st_mtime >= cutoff or is_positive(ev):
             continue
         freed += dir_size(ev)
         removed.append(ev.name)
@@ -51,8 +61,8 @@ def main():
     args = ap.parse_args()
     removed, freed = prune(args.root, args.keep_days, args.dry_run)
     verb = "would remove" if args.dry_run else "removed"
-    print(f"{verb} {len(removed)} negative event(s) older than {args.keep_days}d, "
-          f"{freed / 1e6:.0f} MB")
+    print(f"{verb} {len(removed)} negative event(s) more than {args.keep_days}d "
+          f"older than the newest event, {freed / 1e6:.0f} MB")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ class TestPrune:
 
     def test_unverified_old_event_removed(self, tmp_path):
         _event(tmp_path, "event_old_unverified", 30, positive=None)
+        _event(tmp_path, "event_recent", 1, positive=False)
         removed, _ = prune_events.prune(tmp_path, keep_days=14)
         assert removed == ["event_old_unverified"]
 
@@ -47,9 +48,29 @@ class TestPrune:
 
     def test_dry_run_deletes_nothing(self, tmp_path):
         _event(tmp_path, "event_old_neg", 30, positive=False)
+        _event(tmp_path, "event_recent", 1, positive=False)
         removed, _ = prune_events.prune(tmp_path, keep_days=14, dry_run=True)
         assert removed == ["event_old_neg"]
         assert (tmp_path / "event_old_neg").exists()
+
+    def test_blind_spell_does_not_empty_the_archive(self, tmp_path):
+        """Regression (2026-09): the monitor recorded nothing for 20 days and
+        a now-based window deleted every negative from before the gap. The
+        window now hangs off the newest event, so a gap removes nothing."""
+        _event(tmp_path, "event_before_gap_a", 20, positive=False)
+        _event(tmp_path, "event_before_gap_b", 25, positive=False)
+        _event(tmp_path, "event_long_before", 40, positive=False)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_long_before"]
+
+    def test_future_dated_event_does_not_slide_the_window(self, tmp_path):
+        _event(tmp_path, "event_future", -30, positive=False)
+        _event(tmp_path, "event_recent", 10, positive=False)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == []
+
+    def test_empty_root(self, tmp_path):
+        assert prune_events.prune(tmp_path, keep_days=14) == ([], 0)
 
     def test_non_event_dirs_untouched(self, tmp_path):
         other = tmp_path / "eval_work"

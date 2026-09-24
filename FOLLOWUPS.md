@@ -95,8 +95,9 @@ Standing constraints:
   `--no-session-persistence` (regression-tested) and the old transcripts
   deleted. (2) `data/events/` grows ~30 events/day (~3 GB/8 days);
   `scripts/prune_events.py` now runs daily (`seizureguard-prune.timer`,
-  04:20): keeps 14 days plus **every verifier-positive event forever**
-  (training set), deletes older negatives.
+  04:20): keeps the 14 days before the newest event plus **every
+  verifier-positive event forever** (training set), deletes older
+  negatives.
 - **CORRECTION — there is no live false-alarm figure yet.** An earlier
   note here read the ~230 captured events' `final_abnormal_event: false`
   as "the verifier rejected them". It did not: `failed_batches` equalled
@@ -132,16 +133,17 @@ Two detection gaps let it run for 20 days:
 
 - `systemctl is-active` kept answering `active` while both monitors had
   stopped logging entirely. "Active" is not "watching".
-- The "monitor blind" alert fires once (it did, on 2026-09-04) and never
-  repeats. **Follow-up:** repeat it on a schedule while the stream stays
-  down, the way `OutageNotifier` repeats backend outages.
+- The "monitor blind" alert fired once (on 2026-09-04) and never
+  repeated. **Fixed 2026-09-24:** `StreamWatchdog` repeats it every 6 h
+  while the stream stays dead, and the monitor announces recovery with how
+  long it was blind; the same applies to a stream that cannot be opened at
+  startup.
 
 And one data loss: `prune_events.py` keeps "the last 14 days" measured
 from *now*. With nothing new arriving, it deleted every negative from
 before the outage (129 events, 2026-09-15..18), leaving only the 4
-positives. **Follow-up:** measure the window from the newest event, or
-skip pruning when nothing new arrived, so a blind spell cannot empty the
-archive.
+positives. **Fixed 2026-09-24:** the window is now measured back from the
+newest event, so a blind spell removes nothing (regression-tested).
 
 **Why the monitors never recovered (found 2026-09-24, fixed in
 `3c82190`).** The camera drop-out was the trigger, not the reason the
@@ -167,8 +169,8 @@ fix has two layers:
   path (auth check 30 s + verify probe 120 s); `handle_event` pings from
   a keepalive thread because verify can take minutes.
 
-The repeated blind alert is still worth adding for the case the watchdog
-does not cover: a healthy loop staring at a stream that stays dead.
+The repeated blind alert (added the same day) covers the case the
+watchdog does not: a healthy loop staring at a stream that stays dead.
 
 ## Silent verification outage (found 2026-08-22, the project's worst bug)
 
@@ -210,7 +212,8 @@ tell: an intentionally bogus token produces the same "expired" error
 instead of "invalid". `~/setup-claude-token.sh` now clears it first.
 
 Two quality issues surfaced by that first clean run (neither is a safety
-risk; both are open):
+risk; both resolved since, listed at the end of "False alarms from
+undefined sign vocabulary" below).
 
 ## Alert storm during a quota outage (fixed 2026-09-02)
 
@@ -258,8 +261,14 @@ which is why the pipeline worked.
 
 `should_escalate()` is therefore a documented no-op: it returns True
 always, and the docstring carries this measurement so the optimization is
-not attempted a third time. The screen call still runs for its cheap
-metadata (posture, note); dropping it entirely is a defensible follow-up.
+not attempted a third time.
+
+**Dropped entirely on 2026-09-24.** The no-op gate still cost one extra
+call per batch (half of all calls) and supplied the note the event viewer
+showed as each event's explanation, which on the seizure read "normal
+purposeful walking". Each batch now goes straight to the confirm model,
+whose own note is stored instead. The only remaining cheap-model call is
+the startup health probe (`SEIZUREGUARD_PROBE_MODEL`).
 
 Cost must come from somewhere that cannot cost recall:
 - fewer frames per event (base sampling 2 fps -> 1 fps; bursts carry the
@@ -281,7 +290,8 @@ with interactive work**. Whoever spends it, the monitor is the one that
 goes blind, and it cannot ask for priority. seizureGuard's own footprint,
 for the record: ~20-55 events/day, ~130-380 batches, **~250-690 calls/day**
 (screen + confirm) — real, but not the thing that emptied the bucket that
-afternoon.
+afternoon. Dropping the screen tier (2026-09-24) halved the call count to
+one per batch.
 
 Options, in order of how well they fit a monitor that must not go blind:
 
@@ -351,7 +361,8 @@ also carry how much of the event looked abnormal ("2/7 segments"), which
 is the fastest triage signal: the real seizure spans many segments, false
 alarms one.
 
-- **The screen tier no longer filters anything.** On plainly normal
+- **Resolved: the screen tier was dropped (2026-09-24).** Original
+  finding: **the screen tier no longer filters anything.** On plainly normal
   footage haiku returned `{"seen": "yes", "confidence": 0.05,
   "posture": "standing"}` with a note reading "Normal ambulation
   throughout... no jerking, paddling, stiffening" — so `should_escalate`
@@ -359,7 +370,9 @@ alarms one.
   field name "seen" is ambiguous (the model appears to answer "did I see
   the dog/frames"). Fix: rename it to something unmistakable
   (`abnormal_seen`) and state the question in one line.
-- **`final_confidence` is meaningless for negatives.** It is the max
+- **Resolved in the same pass (see above): `final_confidence` is now the
+  max over positive batches.** Original finding: **`final_confidence` is
+  meaningless for negatives.** It is the max
   batch confidence, and the confirm model reports confidence *in its
   verdict*, so a clearly normal event reported 0.85. Alerts only show it
   for positives, so nothing user-facing is wrong, but do not compare it
@@ -367,9 +380,9 @@ alarms one.
 - Pose gate is NOT active on the Pi (no `SEIZUREGUARD_POSE_PYTHON`):
   every event goes straight to verify. It only ever saved cost, never
   recall. If quota becomes noisy, port it via NCNN export.
-- Claude usage: a no-dog motion event still costs a few haiku screen
-  calls; the no-dog short-circuit stays deliberately unimplemented
-  (fail-open doctrine).
+- Claude usage: a no-dog motion event still costs a few confirm calls
+  (one per batch); the no-dog short-circuit stays deliberately
+  unimplemented (fail-open doctrine).
 
 ## PTZ dog tracker (built 2026-08-09, disabled pending motor reliability)
 
@@ -407,9 +420,6 @@ area, so do not leave it on unattended before one observed session.
   2026-08-09 run (EVAL.md) is n=11. Candidates: more PMC supplementary
   videos (focal/absence semiologies are missing entirely), RodEpil subset
   via HTTP range requests (Zenodo zip supports ranges; 133 req/60s limit).
-- **Batch the screen tier harder.** Each `claude -p` spawn costs process
-  startup; batches of 60 (vs 30) halve the spawn count at slightly higher
-  per-call latency. Measure once real events flow.
 - **K9-Bench FP probe (manual).** Dataset is gated on HF + YouTube-linked;
   needs a human to accept terms and pull ~10 clips, then
   `python scripts/extract_event_from_video.py` + verify per clip. See

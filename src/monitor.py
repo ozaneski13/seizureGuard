@@ -47,7 +47,8 @@ PRE_ROLL_SEC = 5.0           # context saved from before the trigger
 
 # Live-stream health (camera index or RTSP/HTTP URL sources)
 STREAM_RETRY_SEC = 3.0       # sustained read failure before a reconnect attempt
-STREAM_BLIND_ALERT_SEC = 60.0  # still dead after this long -> one alert
+STREAM_BLIND_ALERT_SEC = 60.0  # still dead after this long -> alert
+STREAM_BLIND_REMIND_SEC = 6 * 3600  # ...repeated this often while it stays dead
 STREAM_OPEN_TIMEOUT_MS = 10000   # FFMPEG open/read timeouts: a dead stream
 STREAM_READ_TIMEOUT_MS = 10000   # must fail fast, never block the loop
 WATCHDOG_PING_SEC = 10.0         # systemd WatchdogSec must be well above this
@@ -157,23 +158,41 @@ class MovingFlag:
         return now < self._until
 
 
+def format_duration(sec):
+    if sec < 3600:
+        return f"{max(1, round(sec / 60))} min"
+    if sec < 86400:
+        return f"{sec / 3600:.1f} h"
+    return f"{sec / 86400:.1f} days"
+
+
 class StreamWatchdog:
     """Pure FSM for live-source read health: schedules reconnect attempts and
-    a single 'monitor blind' alert. A blind seizure monitor must say so —
-    silently spinning on a dead stream is the one failure the alert channel
-    exists for."""
+    'monitor blind' alerts. A blind seizure monitor must say so — silently
+    spinning on a dead stream is the one failure the alert channel exists
+    for. One alert is not enough: a single message on day one of a 20-day
+    blind spell is easy to forget, so it repeats while the stream stays dead,
+    and the caller announces recovery."""
 
-    def __init__(self, retry_sec=STREAM_RETRY_SEC, alert_sec=STREAM_BLIND_ALERT_SEC):
+    def __init__(self, retry_sec=STREAM_RETRY_SEC, alert_sec=STREAM_BLIND_ALERT_SEC,
+                 remind_sec=STREAM_BLIND_REMIND_SEC):
         self.retry_sec = retry_sec
         self.alert_sec = alert_sec
+        self.remind_sec = remind_sec
         self.stalled_since = None
         self.last_attempt = None
-        self.alerted = False
+        self.last_alert = None
 
-    def ok(self):
+    def ok(self, now):
+        """Marks the source healthy. Returns how long it was down if a blind
+        alert went out for that stall (recovery must be announced), else None."""
+        down = None
+        if self.last_alert is not None:
+            down = now - self.stalled_since
         self.stalled_since = None
         self.last_attempt = None
-        self.alerted = False
+        self.last_alert = None
+        return down
 
     def failed(self, now):
         """Returns actions to take: 'reconnect' and/or 'blind_alert'."""
@@ -184,8 +203,9 @@ class StreamWatchdog:
         if now - self.last_attempt >= self.retry_sec:
             self.last_attempt = now
             actions.append("reconnect")
-        if not self.alerted and now - self.stalled_since >= self.alert_sec:
-            self.alerted = True
+        if now - self.stalled_since >= self.alert_sec and (
+                self.last_alert is None or now - self.last_alert >= self.remind_sec):
+            self.last_alert = now
             actions.append("blind_alert")
         return actions
 
@@ -492,13 +512,21 @@ def _open_live(source, systemd_watchdog=None):
         if systemd_watchdog is not None:
             systemd_watchdog.ping(time.monotonic())
         try:
-            return open_capture(source)
+            opened = open_capture(source)
         except RuntimeError as e:
             now = time.time()
             if "blind_alert" in watchdog.failed(now):
-                alerts.send_alert(f"Monitor cannot open {source}: {e}")
+                alerts.send_alert(
+                    f"Monitor cannot open {source} for "
+                    f"{format_duration(now - watchdog.stalled_since)}: {e}")
             print(f"[WARN] open failed ({e}); retrying in 5s", flush=True)
             time.sleep(5)
+            continue
+        down = watchdog.ok(time.time())
+        if down is not None:
+            alerts.send_alert(f"Monitor recovered: {source} opened after "
+                              f"{format_duration(down)} blind")
+        return opened
 
 
 def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
@@ -547,11 +575,14 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
                 else:
                     alerts.send_alert(
                         f"Monitor blind: no frames from {source} for "
-                        f"{int(now - watchdog.stalled_since)}s")
+                        f"{format_duration(now - watchdog.stalled_since)}")
             time.sleep(0.5)
             continue
-        watchdog.ok()
         t = frame_idx / fps if file_mode else time.time()
+        down = watchdog.ok(time.time())
+        if down is not None:
+            alerts.send_alert(f"Monitor recovered: frames from {source} again "
+                              f"after {format_duration(down)} blind")
         frame_idx += 1
 
         frame = resize_frame(frame)
