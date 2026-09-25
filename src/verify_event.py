@@ -205,6 +205,10 @@ def parse_json_verdict(text):
         verdict = _salvage(text)
     if verdict is None:
         raise VerdictParseError(str(error) if error else "no JSON verdict object", text)
+    # Sign evidence the rule layer cannot read is no clean negative: fail,
+    # so the repair retry runs and a second odd reply alerts UNVERIFIED.
+    if not decide_signs(verdict) and _signs_unreadable(verdict):
+        raise VerdictParseError("observed_signs is not a list of {sign, present} objects", text)
     return verdict
 
 
@@ -276,13 +280,27 @@ def failed_batch(error, kind):
             "error_kind": kind}
 
 
-def decide_signs(verdict):
-    """Batch-level decision from a confirm verdict (recall-first rule layer)."""
+def _signs_unreadable(verdict):
+    """observed_signs that is not a list, or a present entry without a
+    string sign: the model's shape, whatever it is."""
     signs = verdict.get("observed_signs")
-    if not isinstance(signs, list):      # the model's shape, whatever it is
+    if signs is None:
+        return False
+    if not isinstance(signs, list):
+        return True
+    return any(isinstance(s, dict) and s.get("present") and not isinstance(s.get("sign"), str)
+               for s in signs)
+
+
+def decide_signs(verdict):
+    """Batch-level decision from a confirm verdict (recall-first rule layer).
+    Never raises, the parser runs it on every verdict: a present entry whose
+    sign is no string still counts, as an unnamed sign of its own."""
+    signs = verdict.get("observed_signs")
+    if not isinstance(signs, list):
         signs = []
-    present = {s.get("sign") for s in signs if isinstance(s, dict) and s.get("present")
-               and isinstance(s.get("sign"), str)}
+    present = {s["sign"] if isinstance(s.get("sign"), str) else ("?", i)
+               for i, s in enumerate(signs) if isinstance(s, dict) and s.get("present")}
     if bool(verdict.get("abnormal_event")):
         return True
     if present & HARD_SIGNS:

@@ -254,7 +254,21 @@ class TestSignRules:
     @pytest.mark.parametrize("signs", [7, 0.5, True, "paddling", {"paddling": True},
                                        [{"sign": ["paddling"], "present": True}]])
     def test_odd_observed_signs_shape_does_not_raise(self, signs):
-        assert ve.decide_signs({"abnormal_event": False, "observed_signs": signs}) is False
+        # the parser runs this on every verdict; the shape itself is judged
+        # in parse_json_verdict (TestUnreadableSigns)
+        ve.decide_signs({"abnormal_event": False, "observed_signs": signs})
+
+    def test_present_entry_without_a_sign_name_still_counts(self):
+        verdict = {"abnormal_event": False, "observed_signs": [
+            {"present": True, "body_region": "hind legs"},
+            {"sign": "drooling", "present": True}]}
+        assert ve.decide_signs(verdict) is True
+
+    def test_each_present_entry_without_a_sign_name_counts(self):
+        verdict = {"abnormal_event": False, "observed_signs": [
+            {"present": True, "body_region": "hind legs"},
+            {"sign": ["drooling"], "present": True}]}
+        assert ve.decide_signs(verdict) is True
 
     def test_absent_signs_do_not_count(self):
         verdict = {
@@ -646,6 +660,56 @@ class TestParseFailureRetry:
         assert text[:100] in r["raw_reply"]
 
 
+UNREADABLE_SIGNS = [7, True, "paddling", {"paddling": True},
+                    [{"sign": ["paddling"], "present": True}],
+                    [{"sign": None, "present": True}]]
+
+
+class TestUnreadableSigns:
+    """Regression: sign evidence the rule layer cannot read (a sign name in
+    a list, observed_signs that is no list) was scored as a clean negative;
+    it must fail the batch, which alerts UNVERIFIED, or count as a sign."""
+
+    @pytest.mark.parametrize("signs", UNREADABLE_SIGNS)
+    def test_unreadable_signs_on_a_negative_are_a_failure(self, signs):
+        text = json.dumps({"abnormal_event": False, "confidence": 0.3, "observed_signs": signs})
+        with pytest.raises(ve.VerdictParseError):
+            ve.parse_json_verdict(text)
+
+    @pytest.mark.parametrize("signs", UNREADABLE_SIGNS)
+    def test_unreadable_signs_on_a_positive_are_kept(self, signs):
+        text = json.dumps({"abnormal_event": True, "confidence": 0.3, "observed_signs": signs})
+        assert ve.decide_signs(ve.parse_json_verdict(text)) is True
+
+    def test_nameless_present_sign_keeps_the_event_positive(
+            self, monkeypatch, synthetic_event_dir):
+        reply = json.dumps({"abnormal_event": False, "confidence": 0.3, "observed_signs": [
+            {"present": True, "body_region": "hind legs"},
+            {"sign": "drooling", "present": True}]})
+        monkeypatch.setattr(ve, "run_claude", _fake_run_claude(
+            lambda p: ve.parse_json_verdict(reply)))
+        out = _run_main(monkeypatch, synthetic_event_dir)
+        assert out["final_abnormal_event"] is True
+        assert out["failed_batches"] == 0
+
+    def test_unreadable_sign_fails_the_batch_not_a_negative(
+            self, monkeypatch, synthetic_event_dir):
+        reply = json.dumps({"abnormal_event": False, "confidence": 0.3,
+                            "observed_signs": [{"sign": ["paddling"], "present": True}]})
+        prompts = []
+
+        def confirm(prompt):
+            prompts.append(prompt)
+            return ve.parse_json_verdict(reply)
+
+        monkeypatch.setattr(ve, "run_claude", _fake_run_claude(confirm))
+        out = _run_main(monkeypatch, synthetic_event_dir)
+        assert out["failed_batches"] == len(out["batches"]) > 0
+        assert all(b["error_kind"] == "parse" for b in out["batches"])
+        assert out["backend_outage"] is None
+        assert "never put double quotes" in prompts[1].lower()     # repair retry ran
+
+
 class TestValueCoercion:
     """Regression: a null or non-numeric confidence crashed verify_event
     after the verdict was in, losing every batch including positives."""
@@ -737,6 +801,19 @@ class TestLoginError:
         assert out["final_abnormal_event"] is True
         assert out["batches"][0]["abnormal_event"] is True
         assert out["failed_batches"] == len(out["batches"]) - 1
+
+    def test_login_reason_wins_over_an_earlier_outage(self, monkeypatch, synthetic_event_dir):
+        # The outage notice must say a human has to /login, not to wait out
+        # the usage limit the earlier batches hit.
+        def assess(event_dir, paths, config, bi):
+            if bi <= 4:
+                return ve.failed_batch("claude CLI error: You've hit your limit", ve.ERR_CALL)
+            raise ve.ClaudeLoginError("claude CLI is not logged in - run /login")
+
+        out = self._run(monkeypatch, synthetic_event_dir, assess)
+        limited = sum("hit your limit" in b["error"] for b in out["batches"])
+        assert limited > len(out["batches"]) - limited > 0    # the majority reason
+        assert "not logged in" in out["backend_outage"]
 
 
 def test_analysis_json_is_replaced_atomically(monkeypatch, synthetic_event_dir):
