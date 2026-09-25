@@ -270,10 +270,46 @@ Ops:
 - `deploy-pi.ps1` stages, compiles and imports the files first. It waits
   until no event is in flight and fails loudly on any error.
 
+**Third round (2026-09-25).** A second integration review confirmed 14
+more findings, mostly low severity. Fixed and tested (417 tests):
+- A lost outage notice is saved as the event's undelivered alert and
+  resent. A lost "back online" is not resent, because it could arrive
+  after the next outage; the next healthy verdict sends it again.
+- Attempt cap: an event whose processing killed or wedged the monitor is
+  retried without the in-process video steps. On the third attempt it is
+  sent as UNVERIFIED with its photo. Such retries queue behind live events.
+- A wait-time alert fires when an event has waited more than 10 min for
+  verification, in addition to the count-based backlog alert.
+- `event_meta.json` is written before any frame, so a kill during capture
+  still leaves a dir the sweep finds.
+- verify_event writes `analysis.json` after every batch (`complete:
+  false` until the end) and resumes a cut-off run. A recorded positive is
+  never asked again, and the monitor alerts on it at once. Prune never
+  treats a cut-off run as a verified negative.
+- A positive without a usable confidence reads "confidence unknown". The
+  startup DOWN message states what actually happens during an outage.
+
+**Checked on the Pi after deploy (2026-09-25 12:24):**
+- The staged deploy compiled and imported everything, then restarted.
+  md5 of every shipped file matches the repo.
+- Secrets were migrated. `/etc/seizureguard/*.env` are 600 root, both
+  monitors load all three variables, and `systemctl show` exposes only
+  PATH.
+- A file-mode run of the deployed code on Python 3.13.5 produced
+  event_meta (captured), attempts, event.mp4 built from the spilled
+  frames with `ring/` removed, an alert clip, and handled.json.
+- The abnormal-stop alert was delivered after a real `kill -9` of the
+  c700 monitor, which was back 20 s later.
+- The Pi runs Debian 13 (trixie) with systemd 257, not bookworm. There,
+  ExecStopPost runs after a crash, an OOM-style kill -9 and a watchdog
+  kill, but NOT after `systemctl kill`. Test with kill -9.
+
 Deliberately left open:
 - An `ExecStopPost` alert has no rate limit. A monitor that crash-loops at
-  startup would page every ~11 s. The deploy's import check makes that
+  startup would page every ~20 s. The deploy's import check makes that
   unlikely.
+- A saved outage notice can still be resent after "back online" went
+  out. That errs toward caution, and is not silence.
 - The ~172 s before the first systemd ping at startup is still unpinged
   (under WatchdogSec=300).
 - A reply whose `observed_signs` is a list of bare strings is still

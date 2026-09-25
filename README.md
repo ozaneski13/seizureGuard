@@ -70,11 +70,18 @@ that is still waiting when the monitor restarts gets its video anyway.
 
 Verification runs on a worker thread, so the camera is read the whole
 time an event is being checked. Each event dir records its progress:
-`event_meta.json` is written at capture, and `handled.json` once its alert
-has gone out (text, photo, clip, and whether Telegram accepted it). On
-startup the monitor finishes every event that it captured but did not get
-to handle, and resends every alert Telegram did not accept. A finished
-verdict is never asked for again.
+`event_meta.json` is written first at capture (and marked `captured`
+once every frame is saved). `attempts.json` counts processing attempts.
+`handled.json` is written once the event's alert has gone out: it holds
+the text, photo, clip, and whether Telegram accepted the alert. On startup
+the monitor finishes every event it captured but did not get to handle,
+and resends every alert Telegram did not accept. A finished verdict,
+including a partial one that already found a positive batch, is never
+asked for again. The verifier writes `analysis.json` after every batch and
+resumes a run that was cut off. An event that crashed or wedged the
+monitor twice is not processed a third time: it is sent as UNVERIFIED with
+its photo. If an event waits more than 10 minutes for verification, a
+"waiting for verification ... alerts are delayed" message goes out.
 
 ### Step 3 — Pose gate (optional, local, free)
 
