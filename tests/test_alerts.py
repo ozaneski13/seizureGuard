@@ -58,6 +58,18 @@ class TestConsoleFallback:
         assert "ALERT" in out and "dog event" in out
 
 
+class TestTelegramConfigured:
+    def test_needs_both_token_and_chat(self, monkeypatch):
+        monkeypatch.setenv("SEIZUREGUARD_TG_TOKEN", "123:abc")
+        monkeypatch.delenv("SEIZUREGUARD_TG_CHAT", raising=False)
+        assert alerts.telegram_configured() is False
+        monkeypatch.setenv("SEIZUREGUARD_TG_CHAT", "42")
+        assert alerts.telegram_configured() is True
+
+    def test_console_only_mode(self, no_tg_env):
+        assert alerts.telegram_configured() is False
+
+
 class TestTelegram:
     def test_text_message_goes_to_sendmessage(self, tg_env, monkeypatch):
         requests = []

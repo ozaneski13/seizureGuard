@@ -59,6 +59,12 @@ def _send_telegram(token, chat, text, photo_path, video_path=None):
     return _post(url, body, content_type)
 
 
+def telegram_configured():
+    """True when alerts go to Telegram; False means console-only mode."""
+    return bool(os.environ.get("SEIZUREGUARD_TG_TOKEN")
+                and os.environ.get("SEIZUREGUARD_TG_CHAT"))
+
+
 def send_alert(text, photo_path=None, video_path=None):
     """Deliver an alert. Telegram when configured, console otherwise.
     Prefers the video clip, falls back to the photo, then to plain text.
@@ -66,10 +72,7 @@ def send_alert(text, photo_path=None, video_path=None):
     Never raises — an alert failure must not kill the monitor loop.
     Returns True only when a Telegram message was actually delivered.
     """
-    token = os.environ.get("SEIZUREGUARD_TG_TOKEN")
-    chat = os.environ.get("SEIZUREGUARD_TG_CHAT")
-
-    if not token or not chat:
+    if not telegram_configured():
         print("=" * 60)
         print("🚨 ALERT:", text)
         if video_path is not None:
@@ -80,6 +83,8 @@ def send_alert(text, photo_path=None, video_path=None):
         print("=" * 60)
         return False
 
+    token = os.environ["SEIZUREGUARD_TG_TOKEN"]
+    chat = os.environ["SEIZUREGUARD_TG_CHAT"]
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             if _send_telegram(token, chat, text, photo_path, video_path):

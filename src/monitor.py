@@ -1,14 +1,15 @@
 """Continuous seizure monitor: watches a camera/stream/file through a ring
 buffer, turns sustained motion into captured events, and runs each event
-through the pose gate and VLM verification before alerting.
+through the pose gate and VLM verification before alerting. Verification
+runs on a worker thread, so the read loop never stops watching.
 
 Usage: python src/monitor.py --source <index|file|rtsp url> [--name cam]
 """
 import argparse
-import contextlib
 import faulthandler
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -30,8 +31,11 @@ from sampling import (  # noqa: E402
     WIDTH, HEIGHT, FrameBuffer, encode_jpg, is_global_change,
     motion_score, resize_frame, save_event_frames,
 )
+from verify_event import BATCH_SIZE, frame_time  # noqa: E402
 
 OUT_ROOT = Path("data/events")
+EVENT_META = "event_meta.json"   # what processing needs, written at capture
+HANDLED_MARKER = "handled.json"  # written when processing finished
 
 # Ring buffer
 BUFFER_SECONDS = 90.0
@@ -50,9 +54,20 @@ PRE_ROLL_SEC = 5.0           # context saved from before the trigger
 STREAM_RETRY_SEC = 3.0       # sustained read failure before a reconnect attempt
 STREAM_BLIND_ALERT_SEC = 60.0  # still dead after this long -> alert
 STREAM_BLIND_REMIND_SEC = 6 * 3600  # ...repeated this often while it stays dead
+STREAM_BLIND_RETRY_SEC = 60.0  # ...or this soon when the last one was not delivered
 STREAM_OPEN_TIMEOUT_MS = 10000   # FFMPEG open/read timeouts: a dead stream
 STREAM_READ_TIMEOUT_MS = 10000   # must fail fast, never block the loop
 WATCHDOG_PING_SEC = 10.0         # systemd WatchdogSec must be well above this
+
+# Event worker
+# One event's processing is bounded by its waits: pose gate 600 s + verify
+# 3600 s, plus clip encoding and up to two Telegram sends (2 attempts x 10 s
+# timeouts each), which take well under 20 min. Past this deadline the worker
+# is wedged, not slow, and the main loop stops pinging systemd so its
+# watchdog restarts the monitor.
+HANDLE_DEADLINE_SEC = 5400
+EVENT_BACKLOG_ALERT = 10         # queued events before the owner is told
+SWEEP_MAX_AGE_SEC = 6 * 3600     # restart re-queues unhandled events this recent
 
 
 class RingBuffer:
@@ -173,16 +188,20 @@ class StreamWatchdog:
     spinning on a dead stream is the one failure the alert channel exists
     for. One alert is not enough: a single message on day one of a 20-day
     blind spell is easy to forget, so it repeats while the stream stays dead,
-    and the caller announces recovery."""
+    and the caller announces recovery. An alert the caller could not deliver
+    is retried soon instead of waiting out the reminder interval."""
 
     def __init__(self, retry_sec=STREAM_RETRY_SEC, alert_sec=STREAM_BLIND_ALERT_SEC,
-                 remind_sec=STREAM_BLIND_REMIND_SEC):
+                 remind_sec=STREAM_BLIND_REMIND_SEC,
+                 undelivered_retry_sec=STREAM_BLIND_RETRY_SEC):
         self.retry_sec = retry_sec
         self.alert_sec = alert_sec
         self.remind_sec = remind_sec
+        self.undelivered_retry_sec = undelivered_retry_sec
         self.stalled_since = None
         self.last_attempt = None
         self.last_alert = None
+        self.next_alert = None
 
     def ok(self, now):
         """Marks the source healthy. Returns how long it was down if a blind
@@ -193,7 +212,12 @@ class StreamWatchdog:
         self.stalled_since = None
         self.last_attempt = None
         self.last_alert = None
+        self.next_alert = None
         return down
+
+    def alert_undelivered(self, now):
+        """The last blind alert never reached the owner: try again soon."""
+        self.next_alert = now + self.undelivered_retry_sec
 
     def failed(self, now):
         """Returns actions to take: 'reconnect' and/or 'blind_alert'."""
@@ -205,8 +229,9 @@ class StreamWatchdog:
             self.last_attempt = now
             actions.append("reconnect")
         if now - self.stalled_since >= self.alert_sec and (
-                self.last_alert is None or now - self.last_alert >= self.remind_sec):
+                self.next_alert is None or now >= self.next_alert):
             self.last_alert = now
+            self.next_alert = now + self.remind_sec
             actions.append("blind_alert")
         return actions
 
@@ -246,27 +271,67 @@ class SystemdWatchdog:
         except OSError:
             pass
 
-    @contextlib.contextmanager
-    def keepalive(self):
-        """Keep pinging from a thread while the main loop is blocked in
-        handle_event; every wait inside it (pose gate, verify, Telegram)
-        carries its own timeout, so this cannot mask a wedge forever."""
-        if not self.addr:
-            yield
-            return
-        stop = threading.Event()
 
-        def beat():
-            while not stop.wait(self.interval):
-                self._send(b"WATCHDOG=1")
+class EventWorker:
+    """Processes captured events one at a time on a background thread.
 
-        thread = threading.Thread(target=beat, daemon=True)
-        thread.start()
-        try:
-            yield
-        finally:
-            stop.set()
-            thread.join(timeout=2)
+    Verification takes minutes; run inline, it stopped the read loop for
+    all of them, so a seizure starting meanwhile was never seen and no alert
+    said the monitor was not watching. The queue never drops an event. Only
+    the main loop pings systemd, and it stops once stuck() says one event
+    has run past its deadline, so a wedged worker still gets restarted."""
+
+    def __init__(self, process, deadline=HANDLE_DEADLINE_SEC,
+                 backlog_alert=EVENT_BACKLOG_ALERT):
+        self.process = process              # process(event_dir, fb)
+        self.deadline = deadline
+        self.backlog_alert = backlog_alert
+        self.queue = queue.Queue()
+        self.busy_since = None              # set by the worker, read by the main loop
+        self.backlog_alerted = False        # main thread only
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def submit(self, event_dir, fb=None):
+        """Queues an event. Returns True when this one took the backlog past
+        backlog_alert, once per backlog episode (the caller alerts)."""
+        if self.queue.empty():
+            self.backlog_alerted = False
+        self.queue.put((event_dir, fb))
+        if self.queue.qsize() > self.backlog_alert and not self.backlog_alerted:
+            self.backlog_alerted = True
+            return True
+        return False
+
+    def stuck(self, now):
+        since = self.busy_since             # read once: the worker may clear it
+        return since is not None and now - since > self.deadline
+
+    def close(self):
+        """Processes everything queued, then stops the thread."""
+        self.queue.put(None)
+        self.thread.join()
+
+    def _loop(self):
+        while True:
+            item = self.queue.get()
+            if item is None:
+                self.queue.task_done()
+                return
+            event_dir, fb = item
+            self.busy_since = time.monotonic()
+            try:
+                self.process(event_dir, fb)
+            except Exception as e:
+                # Recall first: an event that crashed its processing is an
+                # event nobody checked, so it still alerts.
+                print(f"[ERROR] processing {Path(event_dir).name} failed: {e!r}",
+                      flush=True)
+                deliver(f"UNVERIFIED motion event - processing failed ({e}) - "
+                        f"{Path(event_dir).name}")
+            finally:
+                self.busy_since = None
+                self.queue.task_done()
 
 
 # ---------------------------------------------------------------- pipeline
@@ -325,15 +390,19 @@ class OutageNotifier:
     Alerting per event during an outage is worse than useless: the backend
     fails identically on all of them, so ~30 identical messages a day train
     the owner to ignore the channel that must never be ignored. Silence is
-    not an option either, so the outage itself is the alert."""
+    not an option either, so the outage itself is the alert. A notice or
+    recovery message that was not delivered gives its slot back."""
 
     def __init__(self, interval=OUTAGE_REMINDER_SEC):
         self.interval = interval
         self.last_notice = None
         self.suppressed = 0
+        self._undo = (None, 0)
 
     def should_notify(self, now):
         if self.last_notice is None or now - self.last_notice >= self.interval:
+            # if this notice is lost, its event is one more unchecked one
+            self._undo = (self.last_notice, self.suppressed + 1)
             self.last_notice = now
             n, self.suppressed = self.suppressed, 0
             return True, n
@@ -341,10 +410,16 @@ class OutageNotifier:
         return False, self.suppressed
 
     def recovered(self):
+        self._undo = (self.last_notice, self.suppressed)
         was_down = self.last_notice is not None
         self.last_notice = None
         self.suppressed = 0
         return was_down
+
+    def undelivered(self):
+        """The message just sent for should_notify() or recovered() never
+        reached the owner: restore the state so the next event retries."""
+        self.last_notice, self.suppressed = self._undo
 
 
 def alert_text_for(verdict, event_name):
@@ -418,9 +493,38 @@ def peak_frame_path(event_dir, peaks, t_start):
     return min(frames, key=lambda p: abs(t_of(p) - target))
 
 
-def handle_event(ring, motion_history, start, end, out_root, use_verify,
-                 name="monitor", outage_notifier=None):
-    outage_notifier = outage_notifier or OutageNotifier()
+def deliver(text, **media):
+    """send_alert, counting console-only mode as delivered: with no Telegram
+    configured there is nothing to retry."""
+    return bool(alerts.send_alert(text, **media)) or not alerts.telegram_configured()
+
+
+def failed_batch_window(verdict, frames, batch_size=BATCH_SIZE):
+    """Time window of the first batch that never got a verdict, or None."""
+    for i, b in enumerate((verdict or {}).get("batches") or []):
+        if b.get("abnormal_event") is None:
+            chunk = frames[i * batch_size:(i + 1) * batch_size]
+            if chunk:
+                return alert_clip.clamp_window(frame_time(chunk[0]), frame_time(chunk[-1]))
+            return None
+    return None
+
+
+def clip_window(verdict, frames, peaks, t0):
+    """Clip from the window the verifier was most confident about; for an
+    unverified alert, the batch it failed on (the part nobody checked), else
+    the first motion peak."""
+    window = None
+    if verdict is not None:
+        window = (alert_clip.best_batch_window(verdict, frames)
+                  or failed_batch_window(verdict, frames))
+    return window or alert_clip.peak_window(peaks, t0)
+
+
+def capture_event(ring, motion_history, start, end, out_root, name="monitor"):
+    """Main-thread half of an event: snapshot the ring and write the frames
+    plus EVENT_META, so the rest can run from disk alone. Kept cheap, as the
+    read loop waits for it. Returns (event_dir, fb) or None."""
     t0 = start - PRE_ROLL_SEC
     fb = ring.snapshot(t0, end)
     if len(fb) == 0:
@@ -435,14 +539,45 @@ def handle_event(ring, motion_history, start, end, out_root, use_verify,
         n += 1
     base_saved, burst_saved, peaks = save_event_frames(
         fb, list(motion_history), event_dir, t0, end)
-    alert_clip.save_event_video(fb, event_dir, t0, end)
+    (event_dir / EVENT_META).write_text(json.dumps(
+        {"t0": t0, "start": start, "end": end, "peaks": peaks}), encoding="utf-8")
     print(f"✅ Event captured: {event_dir} "
           f"({base_saved} base + {burst_saved} burst, {end - start:.1f}s of motion)")
+    return event_dir, fb
+
+
+def read_event_meta(event_dir):
+    """EVENT_META, or safe fallbacks for an event captured before it
+    existed: no peaks means the first frame as photo and no peak clip."""
+    try:
+        meta = json.loads((Path(event_dir) / EVENT_META).read_text(encoding="utf-8"))
+        return {"t0": float(meta["t0"]), "end": float(meta["end"]),
+                "peaks": [float(p) for p in meta.get("peaks") or []]}
+    except Exception:
+        return {"t0": 0.0, "end": None, "peaks": []}
+
+
+def mark_handled(event_dir, alerted, delivered=None):
+    (Path(event_dir) / HANDLED_MARKER).write_text(json.dumps(
+        {"handled_at": time.time(), "alerted": alerted, "delivered": delivered}),
+        encoding="utf-8")
+
+
+def process_event(event_dir, use_verify, outage_notifier, fb=None):
+    """Worker half of an event: event video (when the ring frames are at
+    hand), pose gate, verify, alert, then HANDLED_MARKER. Reads everything
+    else from disk, so a restart can finish an event the previous process
+    never did."""
+    meta = read_event_meta(event_dir)
+    t0, peaks = meta["t0"], meta["peaks"]
+    if fb is not None:
+        alert_clip.save_event_video(fb, event_dir, t0, meta["end"])
 
     decision = run_pose_gate(event_dir)
     if decision == "skip":
         print("[INFO] pose gate: no seizure-like oscillation; not alerting")
-        return event_dir
+        mark_handled(event_dir, alerted=False)
+        return
 
     verdict = run_verify(event_dir) if use_verify else None
     outage = (verdict or {}).get("backend_outage")
@@ -450,31 +585,51 @@ def handle_event(ring, motion_history, start, end, out_root, use_verify,
         notify, skipped = outage_notifier.should_notify(time.time())
         if notify:
             extra = f" ({skipped} further events since the last notice)" if skipped else ""
-            alerts.send_alert(
-                f"seizureGuard: AI verification unavailable{extra} - motion is "
-                f"still being recorded but NOT checked. Reason: {outage}")
+            if not deliver(
+                    f"seizureGuard: AI verification unavailable{extra} - motion is "
+                    f"still being recorded but NOT checked. Reason: {outage}"):
+                outage_notifier.undelivered()
         else:
             print(f"[WARN] verification unavailable ({outage}); "
                   f"{skipped} events unchecked", flush=True)
     elif outage_notifier.recovered():
-        alerts.send_alert("seizureGuard: AI verification is back online.")
+        if not deliver("seizureGuard: AI verification is back online."):
+            outage_notifier.undelivered()
 
     text = alert_text_for(verdict, event_dir.name)
     if text is None:
         print("[INFO] verify: no alert for this event")
-        return event_dir
+        mark_handled(event_dir, alerted=False)
+        return
 
-    # Clip from the window the verifier was most confident about; peak
-    # window for unverified events; photo fallback if encoding fails.
-    if verdict is not None:
-        window = alert_clip.best_batch_window(verdict, alert_clip.event_frames(event_dir))
-    else:
-        window = alert_clip.peak_window(peaks, t0)
+    # make_clip returns None when encoding fails; the photo still goes out.
+    window = clip_window(verdict, alert_clip.event_frames(event_dir), peaks, t0)
     clip = alert_clip.make_clip(event_dir, window)
+    delivered = deliver(text, photo_path=peak_frame_path(event_dir, peaks, t0),
+                        video_path=clip)
+    mark_handled(event_dir, alerted=True, delivered=delivered)
 
-    alerts.send_alert(text, photo_path=peak_frame_path(event_dir, peaks, t0),
-                      video_path=clip)
-    return event_dir
+
+def unhandled_events(out_root, name, now, max_age=SWEEP_MAX_AGE_SEC):
+    """This monitor's events (both monitors share out_root) that a restart
+    left without HANDLED_MARKER, oldest first. Older ones are left alone:
+    events from before the marker existed never got one."""
+    pattern = re.compile(rf"^event_(\d{{8}}_\d{{6}})(?:_(\d+))?_{re.escape(name)}$")
+    found = []
+    try:
+        dirs = list(Path(out_root).iterdir())
+    except OSError:
+        return []
+    for d in dirs:
+        m = pattern.match(d.name)
+        try:
+            if (m is None or not d.is_dir() or (d / HANDLED_MARKER).exists()
+                    or now - d.stat().st_mtime > max_age):
+                continue
+        except OSError:
+            continue
+        found.append(((m.group(1), int(m.group(2) or 0)), d))
+    return [d for _, d in sorted(found)]
 
 
 def open_capture(source):
@@ -516,10 +671,10 @@ def _open_live(source, systemd_watchdog=None):
             opened = open_capture(source)
         except RuntimeError as e:
             now = time.time()
-            if "blind_alert" in watchdog.failed(now):
-                alerts.send_alert(
+            if "blind_alert" in watchdog.failed(now) and not deliver(
                     f"Monitor cannot open {source} for "
-                    f"{format_duration(now - watchdog.stalled_since)}: {e}")
+                    f"{format_duration(now - watchdog.stalled_since)}: {e}"):
+                watchdog.alert_undelivered(now)
             print(f"[WARN] open failed ({e}); retrying in 5s", flush=True)
             time.sleep(5)
             continue
@@ -552,14 +707,48 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
     motion_history = deque()
     watchdog = StreamWatchdog()
     moving_flag = MovingFlag(os.environ.get("SEIZUREGUARD_MOVING_FLAG"))
-    outage_notifier = OutageNotifier()
+    outage_notifier = OutageNotifier()     # used by the worker thread only
+    worker = EventWorker(
+        lambda event_dir, fb: process_event(event_dir, use_verify, outage_notifier, fb))
     events = []
     prev_gray = None
     frame_idx = 0
     last_ring_t = None
+    wedge_reported = False
+
+    def capture(ev):
+        captured = capture_event(ring, motion_history, ev[0], ev[1], out_root, name)
+        if captured is None:
+            return
+        events.append(captured[0])
+        if worker.submit(*captured):
+            waiting = worker.queue.qsize()
+            print(f"[WARN] {waiting} events waiting for verification", flush=True)
+            alerts.send_alert(
+                f"seizureGuard: {waiting} motion events are waiting for "
+                "verification - their alerts are delayed. The camera is still "
+                "being watched.")
+
+    if use_verify and not file_mode:
+        # A restart mid-verify (deploy, token setup, watchdog kill) must not
+        # drop the event it interrupted.
+        requeued = unhandled_events(out_root, name, time.time())
+        for event_dir in requeued:
+            worker.submit(event_dir)
+        if requeued:
+            print(f"[INFO] re-queued {len(requeued)} unfinished events: "
+                  f"{', '.join(d.name for d in requeued)}", flush=True)
 
     while True:
-        systemd_watchdog.ping(time.monotonic())
+        now_mono = time.monotonic()
+        if not worker.stuck(now_mono):
+            wedge_reported = False
+            systemd_watchdog.ping(now_mono)
+        elif not wedge_reported:
+            wedge_reported = True
+            print(f"[ERROR] one event has been processing for over "
+                  f"{HANDLE_DEADLINE_SEC}s; the worker is wedged. No longer "
+                  "pinging systemd, so its watchdog restarts the monitor.", flush=True)
         ret, frame = cap.read()
         if not ret:
             if file_mode:
@@ -573,10 +762,9 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
                         cap, _, _ = open_capture(source)
                     except RuntimeError as e:
                         print(f"[WARN] reconnect failed: {e}", flush=True)
-                else:
-                    alerts.send_alert(
-                        f"Monitor blind: no frames from {source} for "
-                        f"{format_duration(now - watchdog.stalled_since)}")
+                elif not deliver(f"Monitor blind: no frames from {source} for "
+                                 f"{format_duration(now - watchdog.stalled_since)}"):
+                    watchdog.alert_undelivered(now)
             time.sleep(0.5)
             continue
         t = frame_idx / fps if file_mode else time.time()
@@ -613,21 +801,14 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
 
         ev = trigger.feed(t, score, glob)
         if ev is not None:
-            with systemd_watchdog.keepalive():
-                done = handle_event(ring, motion_history, ev[0], ev[1], out_root,
-                                    use_verify, name, outage_notifier)
-            if done is not None:
-                events.append(done)
+            capture(ev)
 
     ev = trigger.flush()
     if ev is not None:
-        with systemd_watchdog.keepalive():
-            done = handle_event(ring, motion_history, ev[0], ev[1], out_root,
-                                use_verify, name, outage_notifier)
-        if done is not None:
-            events.append(done)
+        capture(ev)
 
     cap.release()
+    worker.close()
     return events
 
 
