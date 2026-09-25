@@ -128,6 +128,43 @@ class TestEvaluateClip:
             eval_clips.evaluate_clip(synthetic_video, tmp_path / "work",
                                      verify_cmd=[sys.executable, str(stub)])
 
+    def test_stale_frames_from_an_earlier_run_are_not_verified(
+            self, synthetic_video, tmp_path):
+        # Burst names follow the peak selection, so an extraction after a
+        # tuning change left the old burst frames beside the new ones, and
+        # verify batched both.
+        event_dir = tmp_path / "work" / f"{synthetic_video.stem}_event"
+        (event_dir / "burst").mkdir(parents=True)
+        (event_dir / "burst" / "frame_999_t_999.000s.jpg").write_bytes(b"old")
+        stub = tmp_path / "stub_verify.py"
+        stub.write_text(textwrap.dedent("""
+            import json, sys
+            from pathlib import Path
+            event_dir = Path(sys.argv[1])
+            stale = (event_dir / "burst" / "frame_999_t_999.000s.jpg").exists()
+            out = {"final_abnormal_event": stale, "final_confidence": 0.5,
+                   "failed_batches": 0}
+            (event_dir / "analysis.json").write_text(json.dumps(out))
+        """), encoding="utf-8")
+        row = eval_clips.evaluate_clip(synthetic_video, tmp_path / "work",
+                                       verify_cmd=[sys.executable, str(stub)])
+        assert row["predicted"] is False
+
+    def test_interrupted_negative_is_unanalyzed(self, synthetic_video, tmp_path):
+        # verify writes analysis.json after every batch; a run that was cut
+        # off has not looked at the rest of the clip
+        stub = tmp_path / "stub_verify.py"
+        stub.write_text(textwrap.dedent("""
+            import json, sys
+            from pathlib import Path
+            out = {"final_abnormal_event": False, "final_confidence": 0.9,
+                   "failed_batches": 0, "complete": False}
+            (Path(sys.argv[1]) / "analysis.json").write_text(json.dumps(out))
+        """), encoding="utf-8")
+        row = eval_clips.evaluate_clip(synthetic_video, tmp_path / "work",
+                                       verify_cmd=[sys.executable, str(stub)])
+        assert row["analyzed"] is False
+
 
 def test_main_reports_unanalyzed_clips(tmp_path, monkeypatch, capsys):
     for label, name in (("seizure", "fit.mp4"), ("normal", "walk.mp4"),

@@ -8,13 +8,14 @@ Each clip runs through the real extract + verify pipeline; the prediction is
 compared against its folder label. Results (per-clip table + sensitivity /
 specificity) go to stdout and <eval_root>/results.json.
 
-A clip that was not fully verified (failed batches or a backend outage with
-no positive batch, or no analysis.json at all) is "unanalyzed": it is listed
-separately and kept out of TP/FN/TN/FP. Counting it as a negative would
-inflate specificity with clips nobody looked at.
+A clip that was not fully verified (failed batches, a backend outage or an
+interrupted run with no positive batch, or no analysis.json at all) is
+"unanalyzed": it is listed separately and kept out of TP/FN/TN/FP. Counting
+it as a negative would inflate specificity with clips nobody looked at.
 """
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,11 +30,12 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".ogv"}
 
 def evaluate_clip(video, workdir, verify_cmd=None):
     event_dir = Path(workdir) / f"{video.stem}_event"
+    # The work dir is reused across runs: nothing of an earlier run may be
+    # scored. Its analysis.json would stand in for a verify that wrote
+    # nothing, and its burst frames (named after the peaks it picked) would
+    # be verified beside the new ones.
+    shutil.rmtree(event_dir, ignore_errors=True)
     stats = extract_event(video, event_dir)
-    # The work dir is reused across runs: a verify that writes nothing must
-    # leave no analysis.json to read, so the clip becomes unanalyzed instead
-    # of being scored from an earlier run.
-    (event_dir / "analysis.json").unlink(missing_ok=True)
     cmd = list(verify_cmd) if verify_cmd else [
         sys.executable, str(REPO / "src" / "verify_event.py")]
     subprocess.run(cmd + [str(event_dir)], capture_output=True, timeout=3600)
@@ -41,7 +43,8 @@ def evaluate_clip(video, workdir, verify_cmd=None):
     predicted = bool(analysis.get("final_abnormal_event"))
     # a positive verdict stands; a negative one only counts if every batch ran
     analyzed = predicted or not (analysis.get("failed_batches")
-                                 or analysis.get("backend_outage"))
+                                 or analysis.get("backend_outage")
+                                 or analysis.get("complete") is False)
     return {
         "clip": video.name,
         "predicted": predicted if analyzed else None,
