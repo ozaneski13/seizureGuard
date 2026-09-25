@@ -90,6 +90,23 @@ class TestPrune:
         removed, _ = prune_events.prune(tmp_path, keep_days=14)
         assert removed == ["event_old_neg"]
 
+    def test_interrupted_verification_is_kept_forever(self, tmp_path):
+        """verify_event writes analysis.json after every batch; one it never
+        finished (timeout, restart, crash) says complete false with only the
+        batches it reached. The unasked ones may hold the seizure, so it is
+        unchecked even though its alert (UNVERIFIED) was delivered."""
+        delivered = {"handled_at": 1.0, "alerted": True, "delivered": True,
+                     "text": "UNVERIFIED"}
+        _event(tmp_path, "event_old_interrupted", 30, meta=True, handled=delivered,
+               analysis={"final_abnormal_event": False, "failed_batches": 0,
+                         "backend_outage": None, "complete": False})
+        _event(tmp_path, "event_old_finished", 30, meta=True, handled=delivered,
+               analysis={"final_abnormal_event": False, "failed_batches": 0,
+                         "backend_outage": None, "complete": True})
+        _event(tmp_path, "event_recent", 1, positive=False)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_old_finished"]
+
     def test_captured_but_never_processed_event_is_kept(self, tmp_path):
         # event_meta.json without handled.json: the monitor died before it
         # verified or alerted, so nobody has seen this event.
@@ -328,6 +345,19 @@ class TestHardNegativeSamples:
         # sample slot: the clean 12:00 negative is kept as well.
         assert removed == ["event_20260802_100000_mi360-pi"]
         assert (tmp_path / "event_20260801_120000_mi360-pi").exists()
+
+    def test_interrupted_verification_is_never_a_sample(self, tmp_path):
+        self._fresh(tmp_path, "mi360-pi")
+        ev = _neg(tmp_path, "event_20260801_100000_mi360-pi", 30, present=3)
+        a = json.loads((ev / "analysis.json").read_text(encoding="utf-8"))
+        (ev / "analysis.json").write_text(json.dumps({**a, "complete": False}),
+                                          encoding="utf-8")
+        _neg(tmp_path, "event_20260801_120000_mi360-pi", 30)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        # The interrupted event is kept as unchecked, but it did not take the
+        # sample slot from the finished negative (no "complete" key: a file
+        # from before the key existed is still a verified negative).
+        assert removed == []
 
     def test_samples_are_stable_across_runs(self, tmp_path):
         self._fresh(tmp_path, "mi360-pi")

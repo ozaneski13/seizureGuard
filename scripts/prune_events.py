@@ -36,16 +36,19 @@ def is_positive(event_dir):
 
 
 def is_unchecked(event_dir):
-    """The verdict says the event was never fully checked: a batch failed or
-    the backend was down. verify_event writes final_abnormal_event=false for
-    these too, but a failed verification is not a negative, and an outage
-    sends no per-event alert or clip, so this dir is the only copy. No
+    """The verdict says the event was never fully checked: a batch failed,
+    the backend was down, or the run was cut off (complete false: timeout,
+    restart or crash; the batches it never reached may hold the seizure).
+    verify_event writes final_abnormal_event=false for these too, but a
+    failed verification is not a negative, and an outage sends no per-event
+    alert or clip, so this dir is the only copy. No
     analysis.json at all is not this case: with verify on, that event
     already got its own "unverified" alert with the clip (is_unfinished
     keeps it when that alert was not delivered). Never raises."""
     try:
         a = json.loads((event_dir / "analysis.json").read_text(encoding="utf-8"))
-        return bool(a.get("failed_batches") or a.get("backend_outage"))
+        return bool(a.get("failed_batches") or a.get("backend_outage")
+                    or a.get("complete") is False)
     except Exception:
         return False         # missing: see above; unreadable: is_positive keeps it
 
@@ -74,8 +77,8 @@ def sample_score(event_dir):
     entries marked present across its batches, using decide_signs' present
     test (entries are counted, not de-duplicated by sign name as
     decide_signs does per batch). None when the event is not a clean verified
-    negative — no verdict, a positive, or batches that failed (an unanalyzed
-    batch is not evidence of normal behaviour).
+    negative — no verdict, a positive, batches that failed, or a run that
+    never finished (an unanalyzed batch is not evidence of normal behaviour).
 
     The claude-cli verifier stores observed_signs exactly as the model
     returned them, so any shape can appear. An odd shape must never raise:
@@ -84,7 +87,7 @@ def sample_score(event_dir):
     try:
         a = json.loads((event_dir / "analysis.json").read_text(encoding="utf-8"))
         if (not isinstance(a, dict) or a.get("final_abnormal_event") is not False
-                or a.get("failed_batches")):
+                or a.get("failed_batches") or a.get("complete") is False):
             return None
         batches = a.get("batches")
         score = 0
