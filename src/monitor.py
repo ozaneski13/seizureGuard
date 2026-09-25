@@ -411,7 +411,8 @@ class OutageNotifier:
 
     def recovered(self):
         self._undo = (self.last_notice, self.suppressed)
-        was_down = self.last_notice is not None
+        # a lost first notice leaves no last_notice, only its unchecked event
+        was_down = self.last_notice is not None or self.suppressed > 0
         self.last_notice = None
         self.suppressed = 0
         return was_down
@@ -660,13 +661,14 @@ def open_capture(source):
     return cap, file_mode, fps
 
 
-def _open_live(source, systemd_watchdog=None):
+def _open_live(source, keepalive=None):
     """Open a live source, retrying forever — at boot the restreamer may not
-    be up yet, and a monitor that dies on a slow dependency never watches."""
+    be up yet, and a monitor that dies on a slow dependency never watches.
+    keepalive() runs once per attempt (the caller's systemd ping)."""
     watchdog = StreamWatchdog()
     while True:
-        if systemd_watchdog is not None:
-            systemd_watchdog.ping(time.monotonic())
+        if keepalive is not None:
+            keepalive()
         try:
             opened = open_capture(source)
         except RuntimeError as e:
@@ -687,10 +689,7 @@ def _open_live(source, systemd_watchdog=None):
 
 def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
     systemd_watchdog = SystemdWatchdog()
-    if Path(str(source)).exists():
-        cap, file_mode, fps = open_capture(source)
-    else:
-        cap, file_mode, fps = _open_live(source, systemd_watchdog)
+    file_mode = Path(str(source)).exists()
     use_verify = verify_enabled()
     print(f"✅ Monitoring {'file' if file_mode else 'camera'} {source} "
           f"(verify: {'on' if use_verify else 'off'})")
@@ -716,30 +715,9 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
     last_ring_t = None
     wedge_reported = False
 
-    def capture(ev):
-        captured = capture_event(ring, motion_history, ev[0], ev[1], out_root, name)
-        if captured is None:
-            return
-        events.append(captured[0])
-        if worker.submit(*captured):
-            waiting = worker.queue.qsize()
-            print(f"[WARN] {waiting} events waiting for verification", flush=True)
-            alerts.send_alert(
-                f"seizureGuard: {waiting} motion events are waiting for "
-                "verification - their alerts are delayed. The camera is still "
-                "being watched.")
-
-    if use_verify and not file_mode:
-        # A restart mid-verify (deploy, token setup, watchdog kill) must not
-        # drop the event it interrupted.
-        requeued = unhandled_events(out_root, name, time.time())
-        for event_dir in requeued:
-            worker.submit(event_dir)
-        if requeued:
-            print(f"[INFO] re-queued {len(requeued)} unfinished events: "
-                  f"{', '.join(d.name for d in requeued)}", flush=True)
-
-    while True:
+    def keepalive():
+        # Only this thread pings systemd, and not for a wedged worker.
+        nonlocal wedge_reported
         now_mono = time.monotonic()
         if not worker.stuck(now_mono):
             wedge_reported = False
@@ -749,6 +727,41 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
             print(f"[ERROR] one event has been processing for over "
                   f"{HANDLE_DEADLINE_SEC}s; the worker is wedged. No longer "
                   "pinging systemd, so its watchdog restarts the monitor.", flush=True)
+
+    def enqueue(event_dir, fb=None):
+        if worker.submit(event_dir, fb):
+            waiting = worker.queue.qsize()
+            print(f"[WARN] {waiting} events waiting for verification", flush=True)
+            alerts.send_alert(
+                f"seizureGuard: {waiting} motion events are waiting for "
+                "verification - their alerts are delayed. The camera is still "
+                "being watched.")
+
+    def capture(ev):
+        captured = capture_event(ring, motion_history, ev[0], ev[1], out_root, name)
+        if captured is None:
+            return
+        events.append(captured[0])
+        enqueue(*captured)
+
+    if use_verify and not file_mode:
+        # A restart mid-verify (deploy, token setup, watchdog kill) must not
+        # drop the event it interrupted. Swept before the stream is opened:
+        # the camera may stay down for longer than SWEEP_MAX_AGE_SEC.
+        requeued = unhandled_events(out_root, name, time.time())
+        if requeued:
+            print(f"[INFO] re-queued {len(requeued)} unfinished events: "
+                  f"{', '.join(d.name for d in requeued)}", flush=True)
+        for event_dir in requeued:
+            enqueue(event_dir)
+
+    if file_mode:
+        cap, _, fps = open_capture(source)
+    else:
+        cap, _, fps = _open_live(source, keepalive)
+
+    while True:
+        keepalive()
         ret, frame = cap.read()
         if not ret:
             if file_mode:

@@ -67,6 +67,17 @@ class TestStreamWatchdog:
         assert wd.failed(200.0) == []          # fresh stall, fresh timers
         assert wd.failed(204.0) == ["reconnect"]
 
+    def test_second_stall_after_recovery_alerts_again(self):
+        """A recovery must clear the reminder slot: otherwise a stream that
+        dies again within 6 h stays silently blind until the first alert's
+        reminder is due."""
+        wd = StreamWatchdog(retry_sec=3.0, alert_sec=60.0)
+        wd.failed(100.0)
+        assert "blind_alert" in wd.failed(161.0)
+        wd.ok(170.0)
+        wd.failed(200.0)
+        assert "blind_alert" in wd.failed(261.0)
+
     def test_undelivered_alert_is_retried_soon_not_in_six_hours(self):
         """Regression: a blind alert lost to a WAN hiccup used up the 6 h
         reminder slot, so the owner heard nothing for 6 h."""
@@ -280,7 +291,19 @@ class TestIntegration:
     def events(self, synthetic_video, tmp_path, monkeypatch, alert_calls):
         monkeypatch.setenv("SEIZUREGUARD_VERIFY", "0")
         monkeypatch.delenv("SEIZUREGUARD_POSE_PYTHON", raising=False)
+        real_process = monitor.process_event
+
+        def slow_process(*args, **kwargs):
+            time.sleep(0.3)             # the worker lags the read loop, as in production
+            return real_process(*args, **kwargs)
+
+        monkeypatch.setattr(monitor, "process_event", slow_process)
         return monitor.run(str(synthetic_video), out_root=tmp_path / "events")
+
+    def test_file_run_returns_only_after_every_event_is_handled(self, events):
+        """An offline run must not return while the worker still holds
+        events: their alerts would be lost with the process."""
+        assert all((e / monitor.HANDLED_MARKER).exists() for e in events)
 
     def test_violent_segment_produces_event(self, events):
         assert len(events) >= 1
@@ -309,6 +332,8 @@ class TestIntegration:
         assert (first / "base").is_dir()
         assert (first / "burst").is_dir()
         assert list((first / "burst").glob("frame_*.jpg"))
+        # the full-rate video alert clips are cut from, written by the worker
+        assert (first / "event.mp4").exists()
 
 
 class TestAlertTextFor:
@@ -442,6 +467,14 @@ class TestOutageNotifier:
         n.undelivered()
         assert n.recovered() is True
         assert n.recovered() is False
+
+    def test_recovery_after_a_lost_first_notice_is_still_announced(self):
+        """The event behind a lost notice went unchecked; recovering without
+        a word would leave the owner never hearing about it."""
+        n = monitor.OutageNotifier()
+        n.should_notify(1000.0)
+        n.undelivered()
+        assert n.recovered() is True
 
 
 class TestOutageIsNotAPerEventAlert:
@@ -620,6 +653,36 @@ class TestProcessEvent:
         monitor.process_event(_make_event(tmp_path, "event_c"), True, notifier)
         assert env.sent.count("seizureGuard: AI verification is back online.") == 2
 
+    def test_lost_outage_notice_then_healthy_event_still_says_something(self, env, tmp_path):
+        env.verdict = {"final_abnormal_event": False, "failed_batches": 1,
+                       "batches": [{}], "backend_outage": "529 overloaded"}
+        notifier = monitor.OutageNotifier()
+        env.delivered = False
+        monitor.process_event(_make_event(tmp_path, "event_a"), True, notifier)
+        env.verdict = {"final_abnormal_event": False, "failed_batches": 0,
+                       "batches": [{"abnormal_event": False}]}
+        env.delivered = True
+        monitor.process_event(_make_event(tmp_path, "event_b"), True, notifier)
+        assert env.sent[-1] == "seizureGuard: AI verification is back online."
+
+    def test_event_stays_unhandled_until_processing_finishes(self, env, tmp_path, monkeypatch):
+        """The marker is written last: a restart mid-verify must leave the
+        event for the restart sweep to find."""
+        ev = _make_event(tmp_path)
+
+        class Restart(Exception):
+            pass
+
+        def verify(event_dir):
+            assert not (event_dir / monitor.HANDLED_MARKER).exists()
+            assert monitor.unhandled_events(tmp_path, "mi360", time.time()) == [ev]
+            raise Restart
+
+        monkeypatch.setattr(monitor, "run_verify", verify)
+        with pytest.raises(Restart):
+            monitor.process_event(ev, True, monitor.OutageNotifier())
+        assert monitor.unhandled_events(tmp_path, "mi360", time.time()) == [ev]
+
 
 class TestEventWorker:
     def test_stuck_only_past_the_deadline(self):
@@ -703,6 +766,16 @@ class TestRestartSweep:
     def test_missing_root_is_empty(self, tmp_path):
         assert monitor.unhandled_events(tmp_path / "nope", "mi360", time.time()) == []
 
+    def test_a_freshly_captured_event_is_found_by_the_sweep(self, tmp_path):
+        ring = RingBuffer()
+        jpg = monitor.encode_jpg(QUIET_FRAME)
+        for i in range(300):
+            ring.append(1000.0 + i / 15, jpg)
+        history = [(1000.0 + i / 15, 3.0) for i in range(300)]
+        event_dir, _ = monitor.capture_event(ring, history, 1008.0, 1015.0,
+                                             tmp_path, "mi360")
+        assert monitor.unhandled_events(tmp_path, "mi360", time.time()) == [event_dir]
+
     def _run_live(self, monkeypatch, root, verify):
         processed, done = [], threading.Event()
 
@@ -722,7 +795,7 @@ class TestRestartSweep:
         monkeypatch.setattr(monitor, "verify_enabled", lambda: verify)
         monkeypatch.setattr(monitor, "verify_probe", lambda: (True, None))
         monkeypatch.setattr(monitor, "process_event", fake_process)
-        monkeypatch.setattr(monitor, "_open_live", lambda source, wd=None: (Cap(), False, None))
+        monkeypatch.setattr(monitor, "_open_live", lambda source, *a: (Cap(), False, None))
         with pytest.raises(_Stop):
             monitor.run("rtsp://x/mi360", out_root=root, name="mi360")
         return processed
@@ -756,16 +829,19 @@ def _motion_frame(i):
 @pytest.fixture
 def live(monkeypatch, tmp_path):
     """run() on a live source under a fake clock; each sleep() in the loop
-    (one per failed read) advances it 60 s."""
+    (one per failed read or open) advances it 60 s. The fake monotonic clock
+    is offset from the fake wall clock, as in production, so mixing the two
+    up breaks the tests."""
     clock = [1000.0]
     monkeypatch.setattr(monitor, "time", types.SimpleNamespace(
-        time=lambda: clock[0], monotonic=lambda: clock[0],
+        time=lambda: clock[0], monotonic=lambda: clock[0] - 1e6,
         sleep=lambda s: clock.__setitem__(0, clock[0] + 60),
         strftime=time.strftime))
     for var in ("NOTIFY_SOCKET", "SEIZUREGUARD_MOVING_FLAG", "SEIZUREGUARD_POSE_PYTHON"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("SEIZUREGUARD_VERIFY", "0")
-    state = types.SimpleNamespace(clock=clock, sent=[], deliver=lambda: True)
+    state = types.SimpleNamespace(clock=clock, sent=[], deliver=lambda: True,
+                                  root=tmp_path / "events")
 
     def fake_send(text, photo_path=None, video_path=None):
         delivered = state.deliver()
@@ -775,11 +851,20 @@ def live(monkeypatch, tmp_path):
     monkeypatch.setattr(monitor.alerts, "send_alert", fake_send)
     monkeypatch.setattr(monitor.alerts, "telegram_configured", lambda: True)
 
-    def start(cap):
-        monkeypatch.setattr(monitor, "_open_live", lambda source, wd=None: (cap, False, None))
-        monkeypatch.setattr(monitor, "open_capture", lambda source: (cap, False, None))
+    def start(cap=None):
+        """Runs until _Stop; with no cap, open_capture stays the test's own."""
+        if cap is not None:
+            monkeypatch.setattr(monitor, "_open_live", lambda source, *a: (cap, False, None))
+            monkeypatch.setattr(monitor, "open_capture", lambda source: (cap, False, None))
         with pytest.raises(_Stop):
-            monitor.run("rtsp://x/mi360", out_root=tmp_path / "events", name="mi360")
+            monitor.run("rtsp://x/mi360", out_root=state.root, name="mi360")
+
+    def verify_on(process):
+        monkeypatch.setattr(monitor, "verify_enabled", lambda: True)
+        monkeypatch.setattr(monitor, "verify_probe", lambda: (True, None))
+        monkeypatch.setattr(monitor, "process_event", process)
+
+    state.verify_on = verify_on
 
     state.start = start
     return state
@@ -935,3 +1020,107 @@ class TestLiveRun:
         deadline = cap.busy_from + monitor.HANDLE_DEADLINE_SEC
         assert any(cap.busy_from < t <= deadline for t in pings)   # slow is fine
         assert max(pings) <= deadline + 1.0                          # wedged is not
+
+    def test_restart_while_the_stream_is_down_still_checks_swept_events(self, live, monkeypatch):
+        """Regression: the sweep ran only once the stream opened, so after a
+        restart during a camera outage longer than SWEEP_MAX_AGE_SEC the
+        interrupted event aged out and was never checked or alerted."""
+        live.clock[0] = time.time()             # event dir mtimes are real
+        start = live.clock[0]
+        _make_event(live.root, "event_20260925_010000_mi360", n_frames=1)
+        processed, done_before_open = threading.Event(), []
+        live.verify_on(lambda event_dir, use_verify, notifier, fb=None: processed.set())
+
+        class Cap:
+            def read(self):
+                raise _Stop
+
+            def release(self):
+                pass
+
+        def fake_open(source):
+            if not done_before_open:            # give the worker real time
+                done_before_open.append(processed.wait(5))
+            if live.clock[0] < start + 7 * 3600:
+                raise RuntimeError("Could not open source")
+            return Cap(), False, None
+
+        monkeypatch.setattr(monitor, "open_capture", fake_open)
+        live.start()
+        assert done_before_open == [True]
+
+    def test_wedged_swept_event_stops_the_pings_while_the_stream_is_down(self, live, monkeypatch):
+        monkeypatch.setenv("NOTIFY_SOCKET", "/run/systemd/notify")
+        pings = []
+        monkeypatch.setattr(monitor.SystemdWatchdog, "_send",
+                            lambda self, msg: pings.append(live.clock[0]))
+        processing, unblock = threading.Event(), threading.Event()
+
+        def process(event_dir, use_verify, outage_notifier, fb=None):
+            processing.set()
+            unblock.wait(10)
+
+        live.verify_on(process)
+        _make_event(live.root, "event_20260925_010000_mi360", n_frames=1)
+        busy_from = []
+
+        def fake_open(source):
+            if not busy_from:
+                assert processing.wait(5)
+                busy_from.append(live.clock[0])
+            if live.clock[0] > busy_from[0] + monitor.HANDLE_DEADLINE_SEC + 600:
+                raise _Stop
+            raise RuntimeError("Could not open source")
+
+        monkeypatch.setattr(monitor, "open_capture", fake_open)
+        try:
+            live.start()
+        finally:
+            unblock.set()
+        deadline = busy_from[0] + monitor.HANDLE_DEADLINE_SEC
+        assert any(busy_from[0] < t <= deadline for t in pings)
+        assert max(pings) <= deadline
+
+    def _waiting_alerts(self, live, monkeypatch, swept, captures):
+        """swept unhandled events on disk at startup, then `captures` live
+        events, while the worker is stuck on the first one."""
+        release = threading.Event()
+        live.verify_on(lambda *a, **k: release.wait(10))
+        for i in range(swept):
+            _make_event(live.root, f"event_20260925_0100{i:02d}_mi360", n_frames=1)
+        try:
+            live.start(_MotionEventsCap(live.clock, captures))
+        finally:
+            release.set()
+        return [text for _, text, _ in live.sent if "waiting for verification" in text]
+
+    def test_backlog_from_the_restart_sweep_is_announced_once(self, live, monkeypatch):
+        """Regression: sweep submits dropped the backlog signal, which also
+        silenced it for the live captures queued behind them."""
+        assert len(self._waiting_alerts(live, monkeypatch, swept=12, captures=2)) == 1
+
+    def test_backlog_from_live_captures_is_announced_once(self, live, monkeypatch):
+        assert len(self._waiting_alerts(live, monkeypatch, swept=9, captures=4)) == 1
+
+
+class _MotionEventsCap:
+    """`n` motion events, each 5 s of motion then 12 s of quiet (captured
+    10 s into it); stops the run after the last one. Each read is 1/15 s."""
+
+    PERIOD = 17.0
+
+    def __init__(self, clock, n):
+        self.clock, self.t0, self.n = clock, clock[0], n
+        self.i = 0
+
+    def read(self):
+        elapsed = self.clock[0] - self.t0
+        if elapsed >= self.n * self.PERIOD:
+            raise _Stop
+        self.clock[0] += 1 / 15
+        self.i += 1
+        return True, (_motion_frame(self.i) if elapsed % self.PERIOD < 5.0
+                      else QUIET_FRAME.copy())
+
+    def release(self):
+        pass
