@@ -761,7 +761,8 @@ class TestProcessEvent:
         POSITIVE,
         dict(POSITIVE, failed_batches=3, backend_outage="You've hit your limit"),
         dict(POSITIVE, complete=False),         # verify stopped after the positive
-    ], ids=["positive", "positive-in-outage", "partial-positive"])
+        dict(POSITIVE, complete=False, final_abnormal_event=False),  # final flag not yet set
+    ], ids=["positive", "positive-in-outage", "partial-positive", "partial-positive-batch"])
     def test_finished_positive_verdict_is_reused(self, env, tmp_path, analysis):
         """Regression: a restart between verify and the alert re-verified the
         event from scratch; a nondeterministic second answer silenced a
@@ -900,15 +901,46 @@ class TestProcessEvent:
         assert env.sent[0].startswith("seizureGuard: AI verification unavailable")
         assert monitor.unhandled_events(tmp_path, "mi360") == [ev]
 
-    def test_undelivered_recovery_message_of_a_quiet_event_is_recorded(self, env, tmp_path):
+    def test_lost_recovery_message_is_not_saved_for_a_resend(self, env, tmp_path):
+        """A resent 'back online' could arrive after verification went down
+        again; the next healthy verdict retries it instead."""
         notifier = monitor.OutageNotifier()
         notifier.should_notify(1000.0)
         env.verdict = self.NEGATIVE
         env.delivered = False
         ev = _make_event(tmp_path)
-        assert monitor.process_event(ev, True, notifier) is False
-        assert self._handled(ev)["text"] == "seizureGuard: AI verification is back online."
-        assert notifier.recovered() is True     # not counted as sent either
+        assert monitor.process_event(ev, True, notifier) is True
+        assert self._handled(ev)["alerted"] is False
+        assert monitor.unhandled_events(tmp_path, "mi360") == []
+        assert notifier.recovered() is True     # not counted as sent
+
+    def test_a_lost_recovery_message_never_follows_a_new_outage(self, env, tmp_path,
+                                                                monkeypatch):
+        """Regression: the worker resent a lost 'back online' after
+        verification had gone down again, and the notifier went back to
+        'down', so outage events stayed silent for 6 h while the owner's
+        last message said verification worked."""
+        verdicts = {"event_a": self.OUTAGE, "event_b": self.NEGATIVE, "event_c": self.OUTAGE}
+        monkeypatch.setattr(monitor, "run_verify", lambda d: verdicts[d.name])
+        notifier = monitor.OutageNotifier()
+        w = monitor.EventWorker(lambda d: monitor.process_event(d, True, notifier),
+                                retry_sec=0.05)
+        try:
+            for name, delivered in [("event_a", True), ("event_b", False), ("event_c", False)]:
+                env.delivered = delivered
+                ev = _make_event(tmp_path, name)
+                w.submit(ev)
+                for _ in range(500):
+                    if monitor.read_handled(ev) is not None:
+                        break
+                    time.sleep(0.01)
+            env.delivered = True
+            time.sleep(0.5)                         # ten retry intervals
+        finally:
+            w.close()
+        assert len(env.sent) == 2
+        assert env.sent[0].startswith("seizureGuard: AI verification unavailable")
+        assert env.sent[1] == "seizureGuard: AI verification is back online."   # lost
 
     def test_delivered_outage_notice_closes_the_event(self, env, tmp_path):
         env.verdict = self.OUTAGE
@@ -1185,6 +1217,29 @@ class TestEventWorker:
             w.submit("interrupted", later=True)
             assert self._wait(lambda: order == ["interrupted"])
         finally:
+            w.close()
+
+    def test_later_events_run_one_after_another_oldest_first(self):
+        """After a restart that left several interrupted events, the second
+        must not wait for the next live event."""
+        order, gate = [], threading.Event()
+
+        def process(event_dir):
+            order.append(event_dir)
+            if event_dir == "first":
+                gate.wait(10)
+
+        w = monitor.EventWorker(process)
+        try:
+            w.submit("first")
+            assert self._wait(lambda: w.busy_since is not None)
+            w.submit("x", later=True)
+            w.submit("y", later=True)
+            gate.set()
+            assert self._wait(lambda: len(order) == 3)
+            assert order == ["first", "x", "y"]
+        finally:
+            gate.set()
             w.close()
 
     def test_the_queue_holds_only_event_dirs(self):
@@ -1893,6 +1948,77 @@ class TestLiveRun:
         live.start(Cap())
         assert order == [fresh, captured[0], interrupted]
 
+    def test_a_swept_undelivered_alert_is_not_put_behind_live_events(self, live,
+                                                                      monkeypatch):
+        """Every event the worker saw has an attempt counted, yet one whose
+        alert only awaits a resend needs no verify: it must not wait behind
+        the live events' pose gate and verify."""
+        resend = _make_event(live.root, "event_20260925_010000_mi360", n_frames=1)
+        (resend / monitor.ATTEMPTS_FILE).write_text('{"attempts": 1}')
+        (resend / monitor.HANDLED_MARKER).write_text(json.dumps(
+            {"handled_at": 1.0, "alerted": True, "delivered": False, "text": "positive"}))
+        fresh = _make_event(live.root, "event_20260925_010100_mi360", n_frames=1)
+        order, captured, live_queued = [], [], threading.Event()
+
+        def process(event_dir, use_verify, outage_notifier):
+            order.append(event_dir)
+            if event_dir == fresh:
+                live_queued.wait(10)
+
+        real_capture = monitor.capture_event
+        monkeypatch.setattr(monitor, "capture_event",
+                            lambda *a, **k: captured.append(real_capture(*a, **k)) or captured[-1])
+        live.verify_on(process)
+
+        class Cap:
+            i = 0
+
+            def read(self):
+                if captured:
+                    live_queued.set()
+                    time.sleep(0.001)
+                if len(order) == 3 or live.clock[0] > 1000.0 + 3600:
+                    raise _Stop
+                live.clock[0] += 1 / 15
+                self.i += 1
+                return True, (_motion_frame(self.i) if live.clock[0] < 1005.0
+                              else QUIET_FRAME.copy())
+
+            def release(self):
+                pass
+
+        live.start(Cap())
+        assert order == [resend, fresh, captured[0]]
+
+    def test_a_long_wait_is_announced_while_the_camera_cannot_be_opened(self, live,
+                                                                         monkeypatch):
+        """After a restart the camera may stay down for hours; the open
+        retries are then the only loop that can say a swept event waits."""
+        release = threading.Event()
+        live.verify_on(lambda *a, **k: release.wait(30))
+        _make_event(live.root, "event_20260925_010000_mi360", n_frames=1)   # end 1044.5
+        waits = []
+
+        def down(source):
+            if live.clock[0] > 2500.0:
+                raise _Stop
+            raise RuntimeError("restreamer down")
+
+        def fake_send(text, photo_path=None, video_path=None):
+            ok = "since" not in text or bool(waits)
+            if "since" in text:
+                waits.append((live.clock[0], ok))
+            live.sent.append((live.clock[0], text, ok))
+            return ok
+
+        monkeypatch.setattr(monitor, "open_capture", down)
+        monkeypatch.setattr(monitor.alerts, "send_alert", fake_send)
+        try:
+            live.start()
+        finally:
+            release.set()
+        assert waits == [(1660.0, False), (1720.0, True)]
+
     def test_a_long_wait_is_announced_with_no_new_event(self, live, monkeypatch):
         """Regression: only a queue of over 10 events said alerts were late,
         so one slow verify held the next alert for hours in silence. The
@@ -1957,6 +2083,41 @@ class TestLiveRun:
             assert notifier.recovered() is True
         else:
             assert notifier.should_notify(live.clock[0]) == (True, 0)
+
+    def test_a_restart_into_an_outage_never_says_verification_is_back(self, live,
+                                                                       monkeypatch):
+        """Regression: a lost 'back online' was saved as its quiet event's
+        alert, and the restart sweep sent it right after the probe's 'DOWN',
+        so the owner's last word was that verification worked."""
+        monkeypatch.setattr(monitor, "run_pose_gate", lambda d: "escalate")
+        monkeypatch.setattr(monitor, "run_verify", lambda d: TestProcessEvent.NEGATIVE)
+        ev = _make_event(live.root, "event_20260925_010000_mi360", n_frames=1)
+        notifier = monitor.OutageNotifier()
+        notifier.should_notify(live.clock[0])
+        live.deliver = lambda: False
+        monitor.process_event(ev, True, notifier)       # the last process: 'back online' lost
+        live.sent.clear()
+        live.deliver = lambda: True
+        monkeypatch.setattr(monitor, "verify_enabled", lambda: True)
+        monkeypatch.delenv("SEIZUREGUARD_BACKEND", raising=False)
+        monkeypatch.setattr(monitor, "verify_probe", lambda: (False, "401 token expired"))
+
+        class Cap:
+            reads = 0
+
+            def read(self):
+                self.reads += 1
+                if not monitor.undelivered(monitor.read_handled(ev)) or self.reads > 500:
+                    raise _Stop
+                time.sleep(0.01)
+                return True, QUIET_FRAME.copy()
+
+            def release(self):
+                pass
+
+        live.start(Cap())
+        assert [text for _, text, _ in live.sent if "back online" in text] == []
+        assert "is DOWN" in live.sent[-1][1]
 
     def test_stall_captures_the_motion_in_flight(self, live, monkeypatch):
         """Regression: motion in progress when the stream died was captured

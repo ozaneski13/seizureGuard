@@ -807,7 +807,7 @@ def process_event(event_dir, use_verify, outage_notifier):
         unverified = "capture was interrupted"
     elif attempt >= EVENT_MAX_ATTEMPTS:
         unverified = "processing failed repeatedly"
-    lost_notice = None              # outage or recovery message not delivered
+    lost_notice = None              # outage notice not delivered
     if resend:
         print(f"[INFO] {event_dir.name}: resending its undelivered alert", flush=True)
     elif finished(verdict):
@@ -824,22 +824,25 @@ def process_event(event_dir, use_verify, outage_notifier):
 
         verdict = run_verify(event_dir) if use_verify else None
         outage = (verdict or {}).get("backend_outage")
-        notice = None
         if outage:
             notify, skipped = outage_notifier.should_notify(time.time())
             if notify:
                 extra = f" ({skipped} further events since the last notice)" if skipped else ""
                 notice = (f"seizureGuard: AI verification unavailable{extra} - motion is "
                           f"still being recorded but NOT checked. Reason: {outage}")
+                if not deliver(notice):
+                    outage_notifier.undelivered()
+                    lost_notice = notice
             else:
                 print(f"[WARN] verification unavailable ({outage}); "
                       f"{skipped} events unchecked", flush=True)
         # No analysis at all (verify timed out or crashed) is no sign of health.
         elif verdict is not None and outage_notifier.recovered():
-            notice = "seizureGuard: AI verification is back online."
-        if notice is not None and not deliver(notice):
-            outage_notifier.undelivered()
-            lost_notice = notice
+            # Not saved for a resend like the notice: arriving late, after
+            # verification went down again, it would say the opposite of the
+            # truth. The next healthy verdict retries it.
+            if not deliver("seizureGuard: AI verification is back online."):
+                outage_notifier.undelivered()
 
     if unverified and not (verdict is not None and is_positive(verdict)):
         text = f"UNVERIFIED motion event - {unverified} - {event_dir.name}"
