@@ -9,6 +9,11 @@ could be read; the error holds the first 2000 chars of the reply), "call"
 (the CLI/API call failed; only these can be a backend outage) or "crash"
 (an unexpected exception here). `salvaged: true` with `raw_reply` marks a
 positive read out of an unparseable reply; its confidence is 0.0.
+`multiple_verdicts: true` marks a reply that held more than one verdict
+object (see _find_verdict).
+
+A claude CLI login error still writes analysis.json (the remaining batches
+failed, `backend_outage` set) and then exits non-zero.
 
 Usage: python src/verify_event.py <event_dir>
 """
@@ -124,13 +129,19 @@ class VerdictParseError(ValueError):
 
 
 def _find_verdict(text):
-    """First JSON object in text that carries a verdict, trying every '{'
+    """The JSON object in text that carries a verdict, trying every '{'
     so prose around the object (even prose with braces) does not matter.
     Returns (verdict or None, first decode error or None). A lone sign
     entry is not a verdict: taking one from a broken reply reads as a
-    clean negative."""
+    clean negative.
+
+    Several verdict objects (the prompt's no-dog example quoted, then the
+    real answer) combine recall-first: the last positive one wins, else the
+    last one, marked `multiple_verdicts`. Taking the first read a corrected
+    positive as a clean negative."""
     decoder = json.JSONDecoder()
     first_error = None
+    verdicts = []
     for m in re.finditer(r"\{", text):
         try:
             obj, _ = decoder.raw_decode(text, m.start())
@@ -138,8 +149,13 @@ def _find_verdict(text):
             first_error = first_error or e
             continue
         if isinstance(obj, dict) and ("abnormal_event" in obj or "observed_signs" in obj):
-            return obj, None
-    return None, first_error
+            verdicts.append(obj)
+    if not verdicts:
+        return None, first_error
+    if len(verdicts) == 1:
+        return verdicts[0], None
+    positive = [v for v in verdicts if decide_signs(v)]
+    return dict((positive or verdicts)[-1], multiple_verdicts=True), None
 
 
 def _salvage(text):
@@ -181,6 +197,10 @@ def parse_json_verdict(text):
         # its signs is no verdict.
         if verdict is not None and not decide_signs(verdict):
             verdict = _salvage(text) or (verdict if "observed_signs" in verdict else None)
+    elif not decide_signs(verdict):
+        # A later object that did not decode (a corrected answer with the
+        # usual inner quotes) may hold the positive.
+        verdict = _salvage(text) or verdict
     if verdict is None:
         verdict = _salvage(text)
     if verdict is None:
@@ -258,8 +278,11 @@ def failed_batch(error, kind):
 
 def decide_signs(verdict):
     """Batch-level decision from a confirm verdict (recall-first rule layer)."""
-    signs = verdict.get("observed_signs") or []
-    present = {s.get("sign") for s in signs if isinstance(s, dict) and s.get("present")}
+    signs = verdict.get("observed_signs")
+    if not isinstance(signs, list):      # the model's shape, whatever it is
+        signs = []
+    present = {s.get("sign") for s in signs if isinstance(s, dict) and s.get("present")
+               and isinstance(s.get("sign"), str)}
     if bool(verdict.get("abnormal_event")):
         return True
     if present & HARD_SIGNS:
@@ -433,6 +456,8 @@ def assess_batch_claude(event_dir, paths, config, batch_index):
     if confirm.get("salvaged"):
         result["salvaged"] = True
         result["raw_reply"] = confirm.get("raw_reply")
+    if confirm.get("multiple_verdicts"):
+        result["multiple_verdicts"] = True
     return result
 
 
@@ -555,16 +580,24 @@ def main():
         assess = lambda paths, bi: assess_batch_claude(event_dir, paths, config, bi)
 
     batch_results = []
+    login_error = None
     for bi, batch in enumerate(iter_batches(frames, BATCH_SIZE), start=1):
         # One odd reply must not kill the run: analysis.json would never be
         # written and the other batches' positives would be lost with it.
-        try:
-            r = assess(batch, bi)
-        except ClaudeLoginError:
-            raise
-        except Exception as e:
-            print(f"[WARN] Batch {bi} crashed: {type(e).__name__}: {e}", flush=True)
-            r = failed_batch(f"{type(e).__name__}: {e}", ERR_CRASH)
+        # A login error fails this batch and every later one without another
+        # call; analysis.json still records it as a backend outage, so the
+        # monitor announces it once instead of alerting on every event.
+        if login_error is not None:
+            r = failed_batch(str(login_error), ERR_CALL)
+        else:
+            try:
+                r = assess(batch, bi)
+            except ClaudeLoginError as e:
+                login_error = e
+                r = failed_batch(str(e), ERR_CALL)
+            except Exception as e:
+                print(f"[WARN] Batch {bi} crashed: {type(e).__name__}: {e}", flush=True)
+                r = failed_batch(f"{type(e).__name__}: {e}", ERR_CRASH)
         batch_results.append(r)
         print(f"[INFO] Batch {bi}: abnormal={r['abnormal_event']} "
               f"conf={r['confidence']:.2f} escalated={r['escalated']}", flush=True)
@@ -606,16 +639,23 @@ def main():
         "base_frames": len(list(base_dir.glob("frame_*.jpg"))),
         "burst_frames": len(list(burst_dir.glob("frame_*.jpg"))),
         "positive_batches": len(positive_conf),
-        "backend_outage": outage_reason(batch_results),
+        "backend_outage": (str(login_error)[:200] if login_error is not None
+                           else outage_reason(batch_results)),
         "failed_batches": failed_batches,
         "final_reason": final_reason,
         "batches": batch_results,
     }
 
+    # Written beside it, then renamed over it: the monitor reuses an existing
+    # analysis.json, so no reader may ever see a half-written one.
     out_path = event_dir / "analysis.json"
-    out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    os.replace(tmp_path, out_path)
     print("✅ Analysis written to:", out_path)
     print(json.dumps({"final_abnormal_event": final, "final_confidence": max_conf}, indent=2))
+    if login_error is not None:
+        raise login_error
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -176,6 +177,48 @@ class TestTolerantParse:
         assert v["salvaged"] is True
         assert ve.decide_signs(v) is True
 
+    def test_later_positive_verdict_is_not_lost_to_a_quoted_negative(self):
+        # The prompt carries a literal no-dog example object; a reply that
+        # quotes it before its real answer must not read as a clean negative.
+        pos = {"abnormal_event": True, "confidence": 0.8,
+               "observed_signs": [{"sign": "paddling", "present": True}]}
+        text = ('{"abnormal_event": false, "confidence": 0.0, "observed_signs": [], '
+                '"note": "no dog visible"} does not apply - corrected: ' + json.dumps(pos))
+        v = ve.parse_json_verdict(text)
+        assert ve.decide_signs(v) is True
+        assert v["confidence"] == 0.8
+        assert v["multiple_verdicts"] is True
+
+    def test_positive_verdict_wins_whatever_its_position(self):
+        pos = json.dumps({"abnormal_event": True, "confidence": 0.7, "observed_signs": []})
+        neg = json.dumps({"abnormal_event": False, "confidence": 0.9, "observed_signs": []})
+        v = ve.parse_json_verdict(pos + "\n" + neg)
+        assert v["abnormal_event"] is True
+        assert v["multiple_verdicts"] is True
+
+    def test_several_negative_verdicts_use_the_last(self):
+        first = json.dumps({"abnormal_event": False, "confidence": 0.2, "observed_signs": []})
+        last = json.dumps({"abnormal_event": False, "confidence": 0.6,
+                           "observed_signs": [{"sign": "drooling", "present": True}]})
+        v = ve.parse_json_verdict(first + " draft; final: " + last)
+        assert ve.decide_signs(v) is False
+        assert v["confidence"] == 0.6
+        assert v["multiple_verdicts"] is True
+
+    def test_later_positive_that_does_not_decode_is_salvaged(self):
+        # The quoted negative decodes; the corrected answer carries the usual
+        # inner quotes in its note and does not.
+        text = ('{"abnormal_event": false, "confidence": 0.0, "observed_signs": [], '
+                '"note": "no dog visible"} does not apply - corrected: '
+                + _confirm_reply(present=("paddling",)))
+        v = ve.parse_json_verdict(text)
+        assert ve.decide_signs(v) is True
+        assert v["salvaged"] is True
+
+    def test_sign_entries_inside_one_verdict_are_not_extra_verdicts(self):
+        v = ve.parse_json_verdict(_confirm_reply(present=("paddling",), abnormal=True))
+        assert "multiple_verdicts" not in v
+
     def test_unsalvageable_failure_keeps_the_raw_reply(self):
         text = _confirm_reply(present=("drooling",)).replace(
             '"body_region": "legs"', '"body_region": "the "muzzle""')
@@ -207,6 +250,11 @@ class TestSignRules:
 
     def test_model_abnormal_flag_alone_is_positive(self):
         assert ve.decide_signs(self._verdict([], abnormal=True)) is True
+
+    @pytest.mark.parametrize("signs", [7, 0.5, True, "paddling", {"paddling": True},
+                                       [{"sign": ["paddling"], "present": True}]])
+    def test_odd_observed_signs_shape_does_not_raise(self, signs):
+        assert ve.decide_signs({"abnormal_event": False, "observed_signs": signs}) is False
 
     def test_absent_signs_do_not_count(self):
         verdict = {
@@ -578,6 +626,16 @@ class TestParseFailureRetry:
         assert r["error_kind"] == "call"
         assert "hit your limit" in ve.outage_reason([r])
 
+    def test_multiple_verdicts_mark_the_batch(self, monkeypatch):
+        text = (json.dumps({"abnormal_event": False, "confidence": 0.0, "observed_signs": []})
+                + " corrected: "
+                + json.dumps({"abnormal_event": False, "confidence": 0.8, "observed_signs": [
+                    {"sign": "tonic_stiffening", "present": True}]}))
+        monkeypatch.setattr(ve.subprocess, "run", _cli_reply(text))
+        r = ve.assess_batch_claude(None, [], ve.get_config(), 1)
+        assert r["abnormal_event"] is True
+        assert r["multiple_verdicts"] is True
+
     def test_salvaged_positive_marks_the_batch(self, monkeypatch):
         text = _confirm_reply(present=("paddling",)).replace(
             '"body_region": "legs"', '"body_region": "front "left" leg"')
@@ -638,11 +696,66 @@ class TestBatchGuard:
         assert "TypeError" in crashed["error"]
         assert out["backend_outage"] is None
 
-    def test_login_error_still_aborts_the_run(self, monkeypatch, synthetic_event_dir):
-        def assess(event_dir, paths, config, bi):
-            raise ve.ClaudeLoginError("not logged in")
 
+class TestLoginError:
+    """Regression: a login error aborted the run before analysis.json was
+    written, so the monitor saw a one-off failure and alerted on every event
+    separately instead of announcing one outage."""
+
+    def _run(self, monkeypatch, event_dir, assess):
+        (event_dir / "analysis.json").unlink(missing_ok=True)
         monkeypatch.setattr(ve, "assess_batch_claude", assess)
-        monkeypatch.setattr(sys, "argv", ["verify_event.py", str(synthetic_event_dir)])
-        with pytest.raises(ve.ClaudeLoginError):
+        monkeypatch.setattr(sys, "argv", ["verify_event.py", str(event_dir)])
+        with pytest.raises(ve.ClaudeLoginError):       # still a non-zero exit
             ve.main()
+        return json.loads((event_dir / "analysis.json").read_text())
+
+    def test_login_error_is_written_as_an_outage(self, monkeypatch, synthetic_event_dir):
+        calls = []
+
+        def assess(event_dir, paths, config, bi):
+            calls.append(bi)
+            raise ve.ClaudeLoginError("claude CLI is not logged in - run /login")
+
+        out = self._run(monkeypatch, synthetic_event_dir, assess)
+        assert calls == [1]                  # no model call after a login error
+        assert len(out["batches"]) > 1
+        assert out["failed_batches"] == len(out["batches"])
+        assert all(b["abnormal_event"] is None and b["error_kind"] == "call"
+                   for b in out["batches"])
+        assert out["final_abnormal_event"] is False
+        assert "not logged in" in out["backend_outage"]
+
+    def test_positive_before_the_login_error_is_kept(self, monkeypatch, synthetic_event_dir):
+        def assess(event_dir, paths, config, bi):
+            if bi == 1:
+                return {"abnormal_event": True, "confidence": 0.9, "screen_verdict": None,
+                        "escalated": True, "observed_signs": []}
+            raise ve.ClaudeLoginError("claude CLI is not logged in - run /login")
+
+        out = self._run(monkeypatch, synthetic_event_dir, assess)
+        assert out["final_abnormal_event"] is True
+        assert out["batches"][0]["abnormal_event"] is True
+        assert out["failed_batches"] == len(out["batches"]) - 1
+
+
+def test_analysis_json_is_replaced_atomically(monkeypatch, synthetic_event_dir):
+    """The monitor reuses an existing analysis.json, so it must never see a
+    half-written one: the file is written beside it, then renamed over it."""
+    replaced = []
+    real_replace = ve.os.replace
+
+    def spy(src, dst):
+        replaced.append((Path(src), Path(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(ve.os, "replace", spy)
+    monkeypatch.setattr(ve, "run_claude", _fake_run_claude(
+        lambda p: {"abnormal_event": False, "confidence": 0.1, "observed_signs": []}))
+    out = _run_main(monkeypatch, synthetic_event_dir)
+    target = synthetic_event_dir / "analysis.json"
+    assert len(replaced) == 1
+    src, dst = replaced[0]
+    assert dst == target and src.parent == synthetic_event_dir and src != target
+    assert not src.exists()
+    assert out["final_abnormal_event"] is False
