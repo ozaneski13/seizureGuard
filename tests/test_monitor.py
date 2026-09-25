@@ -702,6 +702,31 @@ class TestProcessEvent:
         assert monitor.process_event(ev, False, monitor.OutageNotifier()) is True
         assert env.sent == [f"Motion event captured (unverified) - {ev.name}"]
 
+    @pytest.mark.parametrize("analysis, text", [
+        (json.dumps(dict(NEGATIVE, failed_batches=1, batches=[{}, {}])),
+         "UNVERIFIED motion event - AI verification failed on 1/2 batches"),
+        (None, "Motion event captured (unverified)"),
+        (json.dumps(NEGATIVE), "Motion event captured (unverified)"),
+    ], ids=["failed-batch", "no-analysis", "clean-negative"])
+    def test_marker_without_alert_text_is_only_resent(self, env, tmp_path, monkeypatch,
+                                                      analysis, text):
+        """Regression: an undelivered alert recorded without its text went
+        through the pose gate and verify again, and a 'skip' or a clean
+        second answer silenced the alert that was due."""
+        ev = _make_event(tmp_path)
+        (ev / monitor.HANDLED_MARKER).write_text(json.dumps(
+            {"handled_at": 1.0, "alerted": True, "delivered": False}))
+        if analysis is not None:
+            (ev / "analysis.json").write_text(analysis)
+        monkeypatch.setattr(monitor, "run_pose_gate",
+                            lambda d: env.gated.append(d) or "skip")
+        env.verdict = self.NEGATIVE
+        assert monitor.process_event(ev, True, monitor.OutageNotifier()) is True
+        assert env.gated == [] and env.verified == []
+        assert env.sent == [f"{text} - {ev.name}"]
+        handled = self._handled(ev)
+        assert handled["delivered"] is True and handled["text"] == env.sent[0]
+
     @pytest.mark.parametrize("analysis", [
         POSITIVE,
         dict(POSITIVE, failed_batches=3, backend_outage="You've hit your limit"),
@@ -905,16 +930,24 @@ class TestEventWorker:
             w.close()
         assert fired == [11, 3611]
 
-    def test_undelivered_backlog_alert_is_retried(self):
-        w, gate = self._blocked()
+    def test_undelivered_backlog_alert_is_retried_after_retry_sec(self):
+        """Not on the very next submit: each failed send blocks the caller
+        for ~22 s, and at restart the sweep submits dozens of events."""
+        w, gate = self._blocked(retry_sec=60.0)
         try:
             fired = [k for k in range(1, 12) if w.submit(f"e{k}", now=float(k))]
-            w.backlog_undelivered()
-            fired += [k for k in (12, 13) if w.submit(f"e{k}", now=float(k))]
+            w.backlog_undelivered(now=11.0)
+            fired += [k for k in (12, 70, 71, 72) if w.submit(f"e{k}", now=float(k))]
         finally:
             gate.set()
             w.close()
-        assert fired == [11, 12]
+        assert fired == [11, 71]
+
+    def test_production_retry_and_reminder_intervals(self):
+        w = monitor.EventWorker(lambda d: None)
+        w.close()
+        assert w.retry_sec == monitor.STREAM_BLIND_RETRY_SEC == 60.0
+        assert w.backlog_remind == monitor.EVENT_BACKLOG_REMIND_SEC == 6 * 3600
 
     def test_the_queue_holds_only_event_dirs(self):
         gate = threading.Event()
@@ -949,6 +982,45 @@ class TestEventWorker:
         w.close()
         assert order[:2] == ["lost", "live"]
         assert order.count("lost") == 3
+
+    def test_retries_interleave_with_a_backlog(self):
+        """A lost seizure alert must not wait for a long backlog to drain."""
+        order = []
+
+        def process(event_dir):
+            order.append(event_dir)
+            if event_dir == "lost":
+                return order.count("lost") >= 3
+            time.sleep(0.05)
+
+        w = monitor.EventWorker(process, retry_sec=0.05)
+        w.submit("lost")
+        for i in range(20):
+            w.submit(f"b{i}")
+        w.close()
+        assert order.count("lost") == 3
+        assert max(i for i, d in enumerate(order) if d == "lost") < order.index("b19")
+
+    def test_crash_whose_marker_cannot_be_written_does_not_kill_the_worker(
+            self, monkeypatch, tmp_path):
+        """A dead worker thread clears busy_since, so stuck() never fires and
+        systemd keeps being pinged while no event is processed again."""
+        sent, done = [], []
+        monkeypatch.setattr(monitor.alerts, "send_alert", lambda text, **kw: sent.append(text))
+        monkeypatch.setattr(monitor.alerts, "telegram_configured", lambda: False)
+        gone = tmp_path / "event_20260925_010000_mi360"     # never created
+
+        def process(event_dir):
+            if event_dir == gone:
+                raise OSError("no such event dir")
+            done.append(event_dir)
+
+        w = monitor.EventWorker(process)
+        w.submit(gone)
+        w.submit("next")
+        w.close()
+        assert done == ["next"]
+        assert any(m.startswith("UNVERIFIED") and gone.name in m for m in sent)
 
     def test_crashing_event_still_alerts_and_the_worker_goes_on(self, monkeypatch, tmp_path):
         sent, done = [], []
@@ -1102,15 +1174,17 @@ class TestRestartSweep:
         _make_event(root, "event_20260925_010000_c700", n_frames=1)
         assert self._run_live(monkeypatch, root, verify=True) == [own]
 
-    def test_sweep_with_verify_off(self, tmp_path, monkeypatch):
+    def test_sweep_with_verify_off(self, tmp_path, monkeypatch, capsys):
         """Regression: with verify off (a failed `claude auth status` probe at
         the restart) the interrupted event got no alert at all; unverified
         is its right alert."""
         root = tmp_path / "events"
         own = _make_event(root, "event_20260925_010000_mi360", n_frames=1)
         assert self._run_live(monkeypatch, root, verify=False) == [own]
+        assert f"re-queued {own.name} (not finished)" in capsys.readouterr().out
 
-    def test_restart_resends_an_undelivered_alert_without_verifying(self, tmp_path, monkeypatch):
+    def test_restart_resends_an_undelivered_alert_without_verifying(self, tmp_path, monkeypatch,
+                                                                    capsys):
         root = tmp_path / "events"
         ev = _make_event(root, "event_20260925_010000_mi360", n_frames=4)
         (ev / "analysis.json").write_text(json.dumps(TestProcessEvent.POSITIVE))
@@ -1148,6 +1222,7 @@ class TestRestartSweep:
         assert sent == [(text, ev / "base" / "frame_001_t_0.500s.jpg", None)]
         assert checked == []
         assert monitor.read_handled(ev)["delivered"] is True
+        assert f"re-queued {ev.name} (alert not delivered)" in capsys.readouterr().out
 
 
 QUIET_FRAME = np.full((360, 640, 3), 40, np.uint8)
@@ -1446,8 +1521,51 @@ class TestLiveRun:
             return len(attempts) > 1              # the first one is lost
 
         live.deliver = deliver
-        assert len(self._waiting_alerts(live, monkeypatch, swept=12, captures=1)) == 2
+        # the 4th capture is the first submit over a minute after the loss
+        assert len(self._waiting_alerts(live, monkeypatch, swept=12, captures=5)) == 2
         assert len(attempts) == 2
+
+    def test_restart_sweep_with_telegram_down_keeps_pinging_systemd(self, live, monkeypatch):
+        """Regression: with Telegram unreachable, every swept submit past the
+        backlog threshold resent the backlog alert from the main thread,
+        ~22 s each, before the stream was opened and with no systemd ping:
+        30 unfinished events kept the monitor from its first ping for over
+        7 min, past WatchdogSec=300, and the kill repeated on every restart."""
+        monkeypatch.setenv("NOTIFY_SOCKET", "/run/systemd/notify")
+        pings = []
+        monkeypatch.setattr(monitor.SystemdWatchdog, "_send",
+                            lambda self, msg: pings.append(live.clock[0]))
+        release = threading.Event()
+        live.verify_on(lambda *a, **k: release.wait(10))
+
+        def probe():
+            live.clock[0] += 120                    # verify_probe's own timeout
+            return False, "timed out"
+
+        def deliver():
+            live.clock[0] += 22                     # 2 attempts x 10 s + 2 s
+            return False
+
+        monkeypatch.setattr(monitor, "verify_probe", probe)
+        live.deliver = deliver
+        for i in range(30):
+            _make_event(live.root, f"event_20260925_01{i:02d}00_mi360", n_frames=1)
+        opened = []
+
+        def fake_open(source, keepalive=None):
+            opened.append(live.clock[0])
+            raise _Stop
+
+        monkeypatch.setattr(monitor, "_open_live", fake_open)
+        start = live.clock[0]
+        try:
+            live.start()
+        finally:
+            release.set()
+        backlog = [t for t, text, _ in live.sent if "waiting for verification" in text]
+        assert len(backlog) == 1                    # not once per swept submit
+        assert pings and pings[0] <= backlog[0] - 22    # pinged before that slow send
+        assert opened[0] - start < 300
 
     def test_stall_captures_the_motion_in_flight(self, live, monkeypatch):
         """Regression: motion in progress when the stream died was captured

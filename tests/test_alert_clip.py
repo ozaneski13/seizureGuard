@@ -117,6 +117,16 @@ class TestEventVideo:
         cap.release()
         assert n >= 60                    # ~5s at 15fps, not 2fps
 
+    def test_spill_on_a_full_disk_never_raises(self, tmp_path, monkeypatch):
+        """spill_ring runs on the read loop: an exception there would end the
+        monitor on every capture while the disk stays full."""
+        def full(self, data):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(alert_clip.Path, "write_bytes", full)
+        alert_clip.spill_ring(self._fb([i / 15.0 for i in range(30)]), tmp_path)
+        assert alert_clip.save_event_video(tmp_path, 0.0) is None
+
     def test_too_few_ring_frames_returns_none(self, tmp_path):
         fb = self._fb([0.0, 0.1])
         alert_clip.spill_ring(fb, tmp_path)

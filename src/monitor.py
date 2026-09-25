@@ -297,31 +297,38 @@ class EventWorker:
         self.busy_since = None              # set by the worker, read by the main loop
         self.retries = {}                   # event_dir -> due time; worker only
         self.backlog_last = None            # (time, size) of the last backlog alert;
-        self._backlog_undo = None           # main thread only
+        self._backlog_undo = None           # these three main thread only
+        self._backlog_retry_at = None
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def submit(self, event_dir, now=None):
         """Queues an event. Returns True when the caller should send a
         backlog alert: the backlog first went past backlog_alert, has doubled
-        since the last alert, or has lasted backlog_remind since it."""
+        since the last alert, or has lasted backlog_remind since it; never
+        sooner than retry_sec after one that was not delivered."""
         now = time.monotonic() if now is None else now
         if self.queue.empty():
             self.backlog_last = None
         self.queue.put(event_dir)
         size = self.queue.qsize()
         last = self.backlog_last
-        if size > self.backlog_alert and (
+        retry_at = self._backlog_retry_at
+        if size > self.backlog_alert and (retry_at is None or now >= retry_at) and (
                 last is None or size >= 2 * last[1] or now - last[0] >= self.backlog_remind):
             self._backlog_undo = last
+            self._backlog_retry_at = None
             self.backlog_last = (now, size)
             return True
         return False
 
-    def backlog_undelivered(self):
-        """The backlog alert never reached the owner: the next submit
-        while the backlog lasts tries again."""
+    def backlog_undelivered(self, now):
+        """The backlog alert never reached the owner: a submit while the
+        backlog lasts tries again, retry_sec from now. Not sooner: a failed
+        send blocks the main thread for ~22 s, and the restart sweep submits
+        dozens of events in a row."""
         self.backlog_last = self._backlog_undo
+        self._backlog_retry_at = now + self.retry_sec
 
     def stuck(self, now):
         since = self.busy_since             # read once: the worker may clear it
@@ -639,22 +646,23 @@ def undelivered(record):
     return bool(record.get("alerted")) and not record.get("delivered")
 
 
-def finished_verdict(event_dir):
-    """analysis.json from an earlier run when it is a finished verdict: a
-    positive, or an analysis with no failed batch and no outage. None means
-    verify (again). A finished verdict is never asked for twice: the model
-    is nondeterministic, and a second answer could silence a positive the
-    first one found."""
+def read_analysis(event_dir):
+    """analysis.json from an earlier run, or None when there is none or it
+    cannot be read."""
     try:
         verdict = json.loads((Path(event_dir) / "analysis.json").read_text(encoding="utf-8"))
     except Exception:
         return None
-    if not isinstance(verdict, dict):
-        return None
-    if verdict.get("final_abnormal_event") or not (
-            verdict.get("failed_batches") or verdict.get("backend_outage")):
-        return verdict
-    return None
+    return verdict if isinstance(verdict, dict) else None
+
+
+def finished(verdict):
+    """A finished verdict: a positive, or an analysis with no failed batch
+    and no outage. Anything else is verified (again). A finished verdict is
+    never asked for twice: the model is nondeterministic, and a second
+    answer could silence a positive the first one found."""
+    return verdict is not None and bool(verdict.get("final_abnormal_event") or not (
+        verdict.get("failed_batches") or verdict.get("backend_outage")))
 
 
 def redeliver(event_dir, handled):
@@ -674,19 +682,24 @@ def process_event(event_dir, use_verify, outage_notifier):
     resent, and a finished verdict is reused. Returns False while its alert
     is undelivered."""
     handled = read_handled(event_dir)
+    resend = False
     if handled is not None:
         if not undelivered(handled):
             return True
         if handled.get("text"):
             return redeliver(event_dir, handled)
-        # a marker from before the text was recorded: build the alert again
+        # A marker from before the text was recorded: its alert was due, so
+        # it is built again from what is on disk, never gated or verified.
+        resend = True
 
     meta = read_event_meta(event_dir)
     t0, peaks = meta["t0"], meta["peaks"]
     alert_clip.save_event_video(event_dir, t0)
 
-    verdict = finished_verdict(event_dir)
-    if verdict is not None:
+    verdict = read_analysis(event_dir)
+    if resend:
+        print(f"[INFO] {event_dir.name}: resending its undelivered alert", flush=True)
+    elif finished(verdict):
         print(f"[INFO] {event_dir.name}: reusing its finished verdict", flush=True)
     else:
         decision = run_pose_gate(event_dir)
@@ -714,6 +727,8 @@ def process_event(event_dir, use_verify, outage_notifier):
                 outage_notifier.undelivered()
 
     text = alert_text_for(verdict, event_dir.name)
+    if text is None and resend:
+        text = alert_text_for(None, event_dir.name)
     if text is None:
         print("[INFO] verify: no alert for this event")
         mark_handled(event_dir, alerted=False)
@@ -857,7 +872,7 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
                     f"seizureGuard: {waiting} motion events are waiting for "
                     "verification - their alerts are delayed. The camera is still "
                     "being watched."):
-                worker.backlog_undelivered()
+                worker.backlog_undelivered(time.monotonic())
 
     def capture(ev):
         event_dir = capture_event(ring, motion_history, ev[0], ev[1], out_root, name)
@@ -870,8 +885,10 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
         # A restart (deploy, token setup, watchdog kill, power cut) must not
         # drop the event it interrupted or an alert that never arrived,
         # whatever their age and whether verify is on. Swept before the
-        # stream is opened: the camera may stay down for hours.
+        # stream is opened: the camera may stay down for hours. A backlog
+        # alert can block here on a slow send, so the sweep pings systemd.
         for event_dir in unhandled_events(out_root, name):
+            keepalive()
             state = "alert not delivered" if read_handled(event_dir) else "not finished"
             print(f"[INFO] re-queued {event_dir.name} ({state})", flush=True)
             enqueue(event_dir)
