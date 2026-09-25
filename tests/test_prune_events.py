@@ -160,6 +160,26 @@ class TestActiveDayWindow:
         _cam(tmp_path, "mi360-pi", [0])
         assert prune_events.prune(tmp_path, keep_days=14)[0] == [before[-1]]
 
+    def test_day_comes_from_the_name_not_the_dir_mtime(self, tmp_path):
+        # verify and make_clip write into the event dir after capture, and so
+        # would a later re-check: a dir mtime is not the day it was recorded.
+        # Counting it would turn old events into new active days and push
+        # untouched pre-gap days out of the window.
+        _cam(tmp_path, "mi360-pi", range(14))
+        old = f"event_{date.today() - timedelta(days=30):%Y%m%d}_120000_mi360-pi"
+        _event(tmp_path, old, 0)              # dir touched today
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == [old]
+
+    def test_ambiguous_camera_names_keep_separate_windows(self, tmp_path):
+        # "2_cam" may be a collision name of "cam" or a camera of its own; as
+        # in daily_samples it is never merged, so a blind "2_cam" keeps its
+        # archive while "cam" records.
+        blind = _cam(tmp_path, "2_cam", range(20, 25))
+        _cam(tmp_path, "cam", range(25))
+        prune_events.prune(tmp_path, keep_days=14)
+        assert all((tmp_path / n).exists() for n in blind)
+
     def test_unnamed_events_ignore_the_cameras_window(self, tmp_path):
         # A hand-made copy has no camera or day in its name. Its window hangs
         # off the newest unnamed event only: a recording camera must not age
