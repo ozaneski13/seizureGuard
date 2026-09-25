@@ -1,22 +1,38 @@
 import json
 import os
 import time
+from datetime import date, timedelta
 
 import prune_events
 
 DAY = 86400
 
 
-def _event(root, name, age_days, positive=None):
+def _event(root, name, age_days, positive=None, analysis=None):
+    """analysis: the analysis.json text, or a dict to dump; written before
+    the mtime is set, since writing into the dir would reset it to now."""
     ev = root / name
     ev.mkdir(parents=True)
     (ev / "frame.jpg").write_bytes(b"x" * 1000)
     if positive is not None:
+        analysis = {"final_abnormal_event": positive}
+    if analysis is not None:
         (ev / "analysis.json").write_text(
-            json.dumps({"final_abnormal_event": positive}), encoding="utf-8")
+            analysis if isinstance(analysis, str) else json.dumps(analysis),
+            encoding="utf-8")
     old = time.time() - age_days * DAY
     os.utime(ev, (old, old))
     return ev
+
+
+def _cam(root, camera, ages, **kw):
+    """One event per age in days for one camera, named the way monitor.py
+    names them, with the mtime matching the day in the name."""
+    names = []
+    for age in ages:
+        day = date.today() - timedelta(days=age)
+        names.append(_event(root, f"event_{day:%Y%m%d}_120000_{camera}", age, **kw).name)
+    return names
 
 
 class TestPrune:
@@ -29,22 +45,45 @@ class TestPrune:
         assert not (tmp_path / "event_old_neg").exists()
         assert (tmp_path / "event_new_neg").exists()
 
+    # Each keep-forever test puts a newer event beside the old one, so the
+    # old event is outside the window and only the keep rule can save it.
     def test_positive_events_kept_forever(self, tmp_path):
         _event(tmp_path, "event_old_pos", 400, positive=True)
+        _event(tmp_path, "event_recent", 1, positive=False)
         removed, _ = prune_events.prune(tmp_path, keep_days=14)
         assert removed == []
 
     def test_unverified_old_event_removed(self, tmp_path):
+        # No analysis.json at all: with verify on, this event already got its
+        # own "unverified" alert with the clip, so it ages out like a negative.
         _event(tmp_path, "event_old_unverified", 30, positive=None)
         _event(tmp_path, "event_recent", 1, positive=False)
         removed, _ = prune_events.prune(tmp_path, keep_days=14)
         assert removed == ["event_old_unverified"]
 
     def test_unreadable_verdict_is_kept(self, tmp_path):
-        ev = _event(tmp_path, "event_old_broken", 30, positive=False)
-        (ev / "analysis.json").write_text("{not json", encoding="utf-8")
+        _event(tmp_path, "event_old_broken", 30, analysis="{not json")
+        _event(tmp_path, "event_recent", 1, positive=False)
         removed, _ = prune_events.prune(tmp_path, keep_days=14)
         assert removed == []
+
+    def test_unchecked_events_kept_forever(self, tmp_path):
+        """A false verdict with failed batches or a backend outage means the
+        event was never checked, not that it was negative. An outage sends no
+        per-event alert or clip, so the event dir is the only copy (review
+        finding: day 15 of an outage deleted day 1 unseen)."""
+        for name, failed, outage in (
+                ("event_old_outage", 2, "claude CLI error: 401 token expired"),
+                ("event_old_partial", 1, None),
+                ("event_old_outage_only", 0, "rate limited"),
+                ("event_old_junk_fields", "two", ["not", "a", "string"])):
+            _event(tmp_path, name, 30, analysis={
+                "final_abnormal_event": False, "failed_batches": failed,
+                "backend_outage": outage})
+        _event(tmp_path, "event_old_neg", 30, positive=False)
+        _event(tmp_path, "event_recent", 1, positive=False)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_old_neg"]
 
     def test_dry_run_deletes_nothing(self, tmp_path):
         _event(tmp_path, "event_old_neg", 30, positive=False)
@@ -55,8 +94,9 @@ class TestPrune:
 
     def test_blind_spell_does_not_empty_the_archive(self, tmp_path):
         """Regression (2026-09): the monitor recorded nothing for 20 days and
-        a now-based window deleted every negative from before the gap. The
-        window now hangs off the newest event, so a gap removes nothing."""
+        a now-based window deleted every negative from before the gap. Names
+        without a camera and day still hang the window off the newest of
+        them, so a gap removes nothing."""
         _event(tmp_path, "event_before_gap_a", 20, positive=False)
         _event(tmp_path, "event_before_gap_b", 25, positive=False)
         _event(tmp_path, "event_long_before", 40, positive=False)
@@ -81,6 +121,55 @@ class TestPrune:
         assert other.exists()
 
 
+class TestActiveDayWindow:
+    """Retention counts the days a camera actually recorded, per camera: a
+    blind camera ages nothing, and its pre-gap archive stays until it has
+    recorded keep_days new days. The events here have no verdict, so no
+    sample or keep-forever rule can save them: only the window decides."""
+
+    def test_active_camera_keeps_its_last_n_days(self, tmp_path):
+        names = _cam(tmp_path, "mi360-pi", range(20))
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert sorted(removed) == sorted(names[14:])
+
+    def test_every_event_of_a_kept_day_is_kept(self, tmp_path):
+        _cam(tmp_path, "mi360-pi", range(1, 14))
+        # Two events today still count as one day: the 14th, not a 15th.
+        _cam(tmp_path, "mi360-pi", [0])
+        _event(tmp_path, f"event_{date.today():%Y%m%d}_000100_mi360-pi", 0)
+        dropped = _cam(tmp_path, "mi360-pi", [14])
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == dropped
+
+    def test_blind_camera_loses_nothing_while_the_other_records(self, tmp_path):
+        # c700 went blind 20 days ago; mi360 kept recording every day.
+        c700 = _cam(tmp_path, "c700-pi", range(20, 25))
+        mi360 = _cam(tmp_path, "mi360-pi", range(25))
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert sorted(removed) == sorted(mi360[14:])
+        assert all((tmp_path / n).exists() for n in c700)
+
+    def test_pre_gap_events_outlive_the_first_event_after_the_gap(self, tmp_path):
+        # 10 recorded days, a blind spell, then recording resumes: the pre-gap
+        # days go one by one as new days are recorded, not all at once.
+        before = _cam(tmp_path, "mi360-pi", range(30, 40))
+        _cam(tmp_path, "mi360-pi", [4])
+        assert prune_events.prune(tmp_path, keep_days=14)[0] == []
+        _cam(tmp_path, "mi360-pi", [1, 2, 3])
+        assert prune_events.prune(tmp_path, keep_days=14)[0] == []
+        _cam(tmp_path, "mi360-pi", [0])
+        assert prune_events.prune(tmp_path, keep_days=14)[0] == [before[-1]]
+
+    def test_unnamed_events_ignore_the_cameras_window(self, tmp_path):
+        # A hand-made copy has no camera or day in its name. Its window hangs
+        # off the newest unnamed event only: a recording camera must not age
+        # it out on the calendar.
+        _event(tmp_path, "event_vid20260111_seizure_window_fable", 60)
+        _cam(tmp_path, "mi360-pi", range(3))
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == []
+
+
 def _neg(root, name, age_days, present=0, failed=0):
     """A verified negative whose batches marked `present` signs as present."""
     ev = root / name
@@ -97,25 +186,28 @@ def _neg(root, name, age_days, present=0, failed=0):
 
 
 class TestHardNegativeSamples:
-    def _fresh(self, root):
-        _event(root, "event_fresh", 0, positive=False)   # keeps the window at now
+    def _fresh(self, root, *cameras):
+        # 14 recent recorded days per camera put the 2026-08 events below
+        # outside the window, so only the sample rule can keep them.
+        for camera in cameras:
+            _cam(root, camera, range(14), positive=False)
 
     def test_one_negative_per_camera_per_day_is_kept(self, tmp_path):
-        self._fresh(tmp_path)
+        self._fresh(tmp_path, "mi360-pi")
         _neg(tmp_path, "event_20260801_100000_mi360-pi", 30)
         _neg(tmp_path, "event_20260801_120000_mi360-pi", 30)
         removed, _ = prune_events.prune(tmp_path, keep_days=14)
         assert removed == ["event_20260801_120000_mi360-pi"]   # tie -> earliest kept
 
     def test_most_sign_like_negative_is_the_sample(self, tmp_path):
-        self._fresh(tmp_path)
+        self._fresh(tmp_path, "mi360-pi")
         _neg(tmp_path, "event_20260801_100000_mi360-pi", 30, present=0)
         _neg(tmp_path, "event_20260801_120000_mi360-pi", 30, present=2)
         removed, _ = prune_events.prune(tmp_path, keep_days=14)
         assert removed == ["event_20260801_100000_mi360-pi"]
 
     def test_each_camera_and_day_gets_its_own_sample(self, tmp_path):
-        self._fresh(tmp_path)
+        self._fresh(tmp_path, "mi360-pi", "c700-pi")
         for name in ("event_20260801_100000_mi360-pi", "event_20260801_110000_mi360-pi",
                      "event_20260801_100000_c700-pi", "event_20260801_110000_c700-pi",
                      "event_20260802_100000_mi360-pi", "event_20260802_110000_mi360-pi"):
@@ -128,7 +220,7 @@ class TestHardNegativeSamples:
     def test_ambiguous_names_never_merge_two_slots(self, tmp_path):
         # "_1_" may be monitor.py's collision suffix or part of a camera named
         # "1_..."; merging would delete one camera's only hard negative.
-        self._fresh(tmp_path)
+        self._fresh(tmp_path, "mi360-pi", "1_mi360-pi", "2_cam", "cam")
         _neg(tmp_path, "event_20260801_100000_mi360-pi", 30)
         _neg(tmp_path, "event_20260801_100000_1_mi360-pi", 30, present=1)
         _neg(tmp_path, "event_20260801_110000_2_cam", 30)
@@ -140,7 +232,7 @@ class TestHardNegativeSamples:
         # The claude-cli verifier stores observed_signs exactly as the model
         # returned them; one odd shape inside the window must not abort every
         # nightly prune (review finding, reproduced before the fix).
-        self._fresh(tmp_path)
+        self._fresh(tmp_path, "mi360-pi")
         shapes = [["none"], {"paddling": {"present": True}}, [None], "paddling", 7]
         for i, signs in enumerate(shapes):
             ev = tmp_path / f"event_202609{10 + i}_100000_odd-pi"
@@ -159,7 +251,7 @@ class TestHardNegativeSamples:
                            "event_20260801_120000_mi360-pi"]
 
     def test_positive_does_not_take_the_negative_slot(self, tmp_path):
-        self._fresh(tmp_path)
+        self._fresh(tmp_path, "mi360-pi")
         _event(tmp_path, "event_20260801_090000_mi360-pi", 30, positive=True)
         _neg(tmp_path, "event_20260801_100000_mi360-pi", 30)
         _neg(tmp_path, "event_20260801_120000_mi360-pi", 30)
@@ -167,16 +259,18 @@ class TestHardNegativeSamples:
         assert removed == ["event_20260801_120000_mi360-pi"]
 
     def test_failed_or_unverified_events_are_never_samples(self, tmp_path):
-        self._fresh(tmp_path)
+        self._fresh(tmp_path, "mi360-pi")
         _neg(tmp_path, "event_20260801_100000_mi360-pi", 30, present=3, failed=2)
         _neg(tmp_path, "event_20260801_120000_mi360-pi", 30)
         _event(tmp_path, "event_20260802_100000_mi360-pi", 30, positive=None)
         removed, _ = prune_events.prune(tmp_path, keep_days=14)
-        assert sorted(removed) == ["event_20260801_100000_mi360-pi",
-                                   "event_20260802_100000_mi360-pi"]
+        # The failed event is kept as unchecked, but it did not take the
+        # sample slot: the clean 12:00 negative is kept as well.
+        assert removed == ["event_20260802_100000_mi360-pi"]
+        assert (tmp_path / "event_20260801_120000_mi360-pi").exists()
 
     def test_samples_are_stable_across_runs(self, tmp_path):
-        self._fresh(tmp_path)
+        self._fresh(tmp_path, "mi360-pi")
         for hour, present in (("10", 1), ("11", 0), ("12", 1), ("13", 0)):
             _neg(tmp_path, f"event_20260801_{hour}0000_mi360-pi", 30, present=present)
         first, _ = prune_events.prune(tmp_path, keep_days=14)
