@@ -11,6 +11,11 @@ ONEMLI: analysis.json icindeki confidence, "nobet olasiligi" DEGIL, modelin
 kendi kararindan ne kadar emin oldugudur. 0.95 confidence + negatif karar =
 "nobet olmadigindan cok eminim". Bu yuzden varsayilan siralama once karara,
 sonra zamana gore yapilir; ham confidence siralamasi ayri bir secenektir.
+
+final_abnormal_event=false yalnizca "ANALIZ EDILEN hicbir batch pozitif
+degil" demektir. Batch'lerden biri hic dogrulanamadiysa (failed_batches /
+backend_outage) olay negatif degil KARARSIZ gosterilir: bakilmayan parca
+nobetin kendisi olabilir.
 """
 import argparse
 import html
@@ -70,17 +75,22 @@ def collect_signs(analysis):
 
 
 def peak_note(analysis):
-    """En yuksek guvenli batch'in kisa notu — kartta baglam icin."""
-    best, best_conf = None, -1.0
-    for b in (analysis.get("batches") or []):
-        c = float(b.get("confidence") or 0.0)
-        if c > best_conf:
-            best, best_conf = b, c
+    """Kartta baglam icin kisa not: once pozitif batch'lerin en guvenlisi,
+    pozitif yoksa analiz edilmis batch'lerin en guvenlisi. Confidence
+    modelin kendi kararindan emin olmasidir; ham en yuksek, pozitif bir
+    olayi 0.95'lik negatif batch'in notuyla aciklardi."""
+    batches = [b for b in (analysis.get("batches") or []) if isinstance(b, dict)]
+    pool = ([b for b in batches if b.get("abnormal_event") is True]
+            or [b for b in batches if b.get("abnormal_event") is not None])
+    best = max(pool, key=lambda b: float(b.get("confidence") or 0.0), default=None)
     if not best:
         return ""
     # confirm-model note; screen notes only exist in pre-2026-09-24 events
-    return (best.get("note")
-            or (best.get("screen_verdict") or {}).get("note") or "")[:300]
+    note = best.get("note")
+    if not isinstance(note, str) or not note:
+        screen = best.get("screen_verdict")
+        note = screen.get("note") if isinstance(screen, dict) else None
+    return note[:300] if isinstance(note, str) else ""
 
 
 def scan_events(root):
@@ -97,12 +107,19 @@ def scan_events(root):
             clip = d / "alert_clip.mp4"
             video = clip if clip.exists() else None
         verdict = a.get("final_abnormal_event")
+        failed = int(a.get("failed_batches") or 0)
         items.append({
             "id": d.name,
             "camera": cam,
             "when": when.isoformat(timespec="seconds"),
             "when_ts": when.timestamp(),
             "verdict": verdict,
+            # verdict True ise dogrulanamayan batch karari degistirmez;
+            # degilse eksik bakilmis olay negatif sayilamaz
+            "unchecked": verdict is not True and (
+                verdict is None or failed > 0 or bool(a.get("backend_outage"))),
+            "failed_batches": failed,
+            "total_batches": len(a.get("batches") or []),
             "confidence": float(a.get("final_confidence") or 0.0),
             "reason": a.get("final_reason") or "",
             "signs": collect_signs(a),
@@ -144,8 +161,9 @@ def sort_items(items, mode):
         return sorted(items, key=lambda e: (e["confidence"], e["when_ts"]), reverse=True)
     if mode == "time":
         return sorted(items, key=lambda e: e["when_ts"], reverse=True)
-    # varsayilan: once pozitifler, sonra en yeni
-    return sorted(items, key=lambda e: (e["verdict"] is True, e["when_ts"]), reverse=True)
+    # varsayilan: once pozitifler, sonra kararsizlar, sonra en yeni
+    return sorted(items, key=lambda e: (e["verdict"] is True, e["unchecked"], e["when_ts"]),
+                  reverse=True)
 
 
 def video_path(root, event_id):
@@ -192,12 +210,23 @@ def thumb_path(root, event_id, thumbs_dir):
         return None
 
 
-def badge(e):
+def verdict_label(e):
     if e["verdict"] is True:
-        return '<span class="b pos">POZITIF</span>'
-    if e["verdict"] is None:
-        return '<span class="b unk">KARARSIZ</span>'
-    return '<span class="b neg">negatif</span>'
+        return "POZITIF"
+    return "KARARSIZ" if e["unchecked"] else "negatif"
+
+
+def badge(e):
+    cls = {"POZITIF": "pos", "KARARSIZ": "unk", "negatif": "neg"}[verdict_label(e)]
+    return '<span class="b ' + cls + '">' + verdict_label(e) + '</span>'
+
+
+def unchecked_text(e):
+    """'2/7 dogrulanamadi' — yalnizca pozitif olmayan, eksik bakilmis olayda."""
+    if not e["unchecked"] or not e["failed_batches"]:
+        return ""
+    total = e["total_batches"] or e["failed_batches"]
+    return "%d/%d dogrulanamadi" % (e["failed_batches"], total)
 
 
 def card_html(e):
@@ -212,6 +241,7 @@ def card_html(e):
         '<div class="meta">',
         '<div class="line1">' + badge(e) + '<span class="when">' + esc(when) + '</span></div>',
         '<div class="line2">' + esc(e["camera"]),
+        (' &middot; ' + esc(unchecked_text(e))) if unchecked_text(e) else "",
         (' &middot; ' + esc(", ".join(e["signs"][:3]))) if e["signs"] else "",
         '</div>',
         '</div></a>',
@@ -267,9 +297,10 @@ def index_html(items, sort_mode, only):
                 + label + '</a>')
 
     pos = sum(1 for e in items if e["verdict"] is True)
+    unk = sum(1 for e in items if e["unchecked"])
     head = ["<h1>seizureGuard olay arsivi</h1>",
             '<div class="sub">', str(len(items)), " olay &middot; ", str(pos),
-            " pozitif &middot; confidence = modelin kendi kararindan emin olma derecesi, ",
+            " pozitif &middot; ", str(unk), " kararsiz &middot; confidence = modelin kendi kararindan emin olma derecesi, ",
             "nobet olasiligi degil</div>",
             '<div class="bar">',
             link("Once pozitifler", "default", only),
@@ -289,8 +320,8 @@ def detail_html(e):
     esc = html.escape
     rows = [("Zaman", e["when"].replace("T", " ")),
             ("Kamera", e["camera"]),
-            ("Karar", "POZITIF" if e["verdict"] is True
-             else ("KARARSIZ" if e["verdict"] is None else "negatif")),
+            ("Karar", verdict_label(e)),
+            ("Dogrulama", unchecked_text(e) or "-"),
             ("Confidence", "%.2f" % e["confidence"]),
             ("Gerekce", e["reason"]),
             ("Isaretler", ", ".join(e["signs"]) or "-"),
