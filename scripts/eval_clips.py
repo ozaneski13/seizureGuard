@@ -30,6 +30,10 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".ogv"}
 def evaluate_clip(video, workdir, verify_cmd=None):
     event_dir = Path(workdir) / f"{video.stem}_event"
     stats = extract_event(video, event_dir)
+    # The work dir is reused across runs: a verify that writes nothing must
+    # leave no analysis.json to read, so the clip becomes unanalyzed instead
+    # of being scored from an earlier run.
+    (event_dir / "analysis.json").unlink(missing_ok=True)
     cmd = list(verify_cmd) if verify_cmd else [
         sys.executable, str(REPO / "src" / "verify_event.py")]
     subprocess.run(cmd + [str(event_dir)], capture_output=True, timeout=3600)

@@ -113,6 +113,22 @@ class TestEvaluateClip:
         assert row["predicted"] is True
 
 
+    def test_stale_analysis_from_an_earlier_run_is_not_scored(
+            self, synthetic_video, tmp_path):
+        # Regression: the work dir is reused across runs, so a verify that
+        # wrote nothing (logged out, no API key) was scored from yesterday's
+        # analysis.json with unanalyzed=0.
+        event_dir = tmp_path / "work" / f"{synthetic_video.stem}_event"
+        event_dir.mkdir(parents=True)
+        (event_dir / "analysis.json").write_text(json.dumps(
+            {"final_abnormal_event": True, "final_confidence": 0.9, "failed_batches": 0}))
+        stub = tmp_path / "stub_verify.py"
+        stub.write_text("raise SystemExit(1)\n", encoding="utf-8")
+        with pytest.raises(FileNotFoundError):
+            eval_clips.evaluate_clip(synthetic_video, tmp_path / "work",
+                                     verify_cmd=[sys.executable, str(stub)])
+
+
 def test_main_reports_unanalyzed_clips(tmp_path, monkeypatch, capsys):
     for label, name in (("seizure", "fit.mp4"), ("normal", "walk.mp4"),
                         ("normal", "crash.mp4")):
