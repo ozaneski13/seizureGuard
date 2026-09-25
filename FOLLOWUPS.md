@@ -303,11 +303,12 @@ more findings, mostly low severity. Fixed and tested (417 tests):
 - The Pi runs Debian 13 (trixie) with systemd 257, not bookworm. There,
   ExecStopPost runs after a crash, an OOM-style kill -9 and a watchdog
   kill, but NOT after `systemctl kill`. Test with kill -9.
+- The abnormal-stop alert is rate-limited (`src/stop_alert.py`). The first
+  stop is announced at once. A crash loop then gets at most one message
+  per 30 min, each counting the stops since the last one. An undelivered
+  message is retried on the next stop.
 
 Deliberately left open:
-- An `ExecStopPost` alert has no rate limit. A monitor that crash-loops at
-  startup would page every ~20 s. The deploy's import check makes that
-  unlikely.
 - A saved outage notice can still be resent after "back online" went
   out. That errs toward caution, and is not silence.
 - The ~172 s before the first systemd ping at startup is still unpinged
