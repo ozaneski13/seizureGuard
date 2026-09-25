@@ -38,6 +38,18 @@ class TestSummarize:
         assert m["sensitivity"] is None
         assert m["specificity"] == 0.0 or m["specificity"] == 1.0
 
+    def test_unanalyzed_clips_are_counted_apart(self):
+        rows = [
+            {"clip": "a.mp4", "expected": True, "predicted": True},
+            {"clip": "b.mp4", "expected": False, "predicted": False},
+            {"clip": "c.mp4", "expected": False, "predicted": None, "analyzed": False},
+            {"clip": "d.mp4", "expected": True, "predicted": None, "analyzed": False},
+        ]
+        m = eval_clips.summarize(rows)
+        assert (m["tp"], m["fn"], m["tn"], m["fp"]) == (1, 0, 1, 0)
+        assert m["unanalyzed"] == 2
+        assert m["unanalyzed_clips"] == ["c.mp4", "d.mp4"]
+
 
 class TestEvaluateClip:
     def test_runs_extract_and_stub_verify(self, synthetic_video, tmp_path):
@@ -57,6 +69,51 @@ class TestEvaluateClip:
         assert row["confidence"] == 0.77
         assert row["frames"] > 100
         assert row["window"] > 50
+        assert row["analyzed"] is True
+
+    @pytest.mark.parametrize("partial", [
+        {"failed_batches": 1},
+        {"failed_batches": 2, "backend_outage": "401 OAuth access token has expired"},
+    ])
+    def test_failed_verification_is_unanalyzed(self, synthetic_video, tmp_path, partial):
+        stub = tmp_path / "stub_verify.py"
+        stub.write_text(textwrap.dedent("""
+            import json, sys
+            from pathlib import Path
+            out = {"final_abnormal_event": False, "final_confidence": 0.9}
+            out.update(json.loads(sys.argv[1]))
+            (Path(sys.argv[2]) / "analysis.json").write_text(json.dumps(out))
+        """), encoding="utf-8")
+        row = eval_clips.evaluate_clip(
+            synthetic_video, tmp_path / "work",
+            verify_cmd=[sys.executable, str(stub), json.dumps(partial)])
+        assert row["analyzed"] is False
+        assert row["predicted"] is None
+
+
+def test_main_reports_unanalyzed_clips(tmp_path, monkeypatch, capsys):
+    for label, name in (("seizure", "fit.mp4"), ("normal", "walk.mp4"),
+                        ("normal", "crash.mp4")):
+        (tmp_path / label).mkdir(exist_ok=True)
+        (tmp_path / label / name).write_bytes(b"")
+
+    def fake_evaluate(video, workdir):
+        if video.name == "crash.mp4":
+            raise FileNotFoundError("analysis.json")
+        if video.name == "walk.mp4":
+            return {"clip": video.name, "predicted": None, "analyzed": False,
+                    "confidence": 0.9, "failed_batches": 1}
+        return {"clip": video.name, "predicted": True, "analyzed": True,
+                "confidence": 0.8, "failed_batches": 0}
+
+    monkeypatch.setattr(eval_clips, "evaluate_clip", fake_evaluate)
+    monkeypatch.setattr(sys, "argv", ["eval_clips", "--eval-root", str(tmp_path)])
+    eval_clips.main()
+    m = json.loads((tmp_path / "results.json").read_text(encoding="utf-8"))["metrics"]
+    assert (m["tp"], m["fn"], m["tn"], m["fp"]) == (1, 0, 0, 0)
+    assert m["specificity"] is None
+    assert m["unanalyzed_clips"] == ["crash.mp4", "walk.mp4"]
+    assert "unanalyzed=2" in capsys.readouterr().out
 
 
 class TestShiftRegion:

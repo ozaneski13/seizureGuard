@@ -7,6 +7,11 @@ Layout:
 Each clip runs through the real extract + verify pipeline; the prediction is
 compared against its folder label. Results (per-clip table + sensitivity /
 specificity) go to stdout and <eval_root>/results.json.
+
+A clip that was not fully verified (failed batches or a backend outage with
+no positive batch, or no analysis.json at all) is "unanalyzed": it is listed
+separately and kept out of TP/FN/TN/FP. Counting it as a negative would
+inflate specificity with clips nobody looked at.
 """
 import argparse
 import json
@@ -29,9 +34,14 @@ def evaluate_clip(video, workdir, verify_cmd=None):
         sys.executable, str(REPO / "src" / "verify_event.py")]
     subprocess.run(cmd + [str(event_dir)], capture_output=True, timeout=3600)
     analysis = json.loads((event_dir / "analysis.json").read_text())
+    predicted = bool(analysis.get("final_abnormal_event"))
+    # a positive verdict stands; a negative one only counts if every batch ran
+    analyzed = predicted or not (analysis.get("failed_batches")
+                                 or analysis.get("backend_outage"))
     return {
         "clip": video.name,
-        "predicted": bool(analysis.get("final_abnormal_event")),
+        "predicted": predicted if analyzed else None,
+        "analyzed": analyzed,
         "confidence": analysis.get("final_confidence", 0.0),
         "failed_batches": analysis.get("failed_batches", 0),
         "frames": stats["base"] + stats["burst"],
@@ -40,13 +50,18 @@ def evaluate_clip(video, workdir, verify_cmd=None):
 
 
 def summarize(rows):
-    """rows: [{expected: bool, predicted: bool, ...}] -> metrics dict."""
+    """rows: [{expected: bool, predicted: bool, analyzed: bool, ...}] -> metrics
+    dict. Rows with analyzed=False are reported apart, never scored."""
+    unanalyzed = [r for r in rows if r.get("analyzed") is False]
+    rows = [r for r in rows if r.get("analyzed") is not False]
     tp = sum(1 for r in rows if r["expected"] and r["predicted"])
     fn = sum(1 for r in rows if r["expected"] and not r["predicted"])
     tn = sum(1 for r in rows if not r["expected"] and not r["predicted"])
     fp = sum(1 for r in rows if not r["expected"] and r["predicted"])
     return {
-        "clips": len(rows),
+        "clips": len(rows) + len(unanalyzed),
+        "unanalyzed": len(unanalyzed),
+        "unanalyzed_clips": [r.get("clip") for r in unanalyzed],
         "tp": tp, "fn": fn, "tn": tn, "fp": fp,
         "sensitivity": tp / (tp + fn) if tp + fn else None,
         "specificity": tn / (tn + fp) if tn + fp else None,
@@ -73,10 +88,13 @@ def main():
                 row = evaluate_clip(video, args.eval_root / "work")
             except Exception as e:
                 print(f"[WARN] {video.name} failed: {e}", flush=True)
-                continue
+                row = {"clip": video.name, "predicted": None, "analyzed": False,
+                       "error": str(e)}
             row["expected"] = expected
             row["label"] = label
             rows.append(row)
+            if not row["analyzed"]:
+                continue
             mark = "OK " if row["predicted"] == expected else "MISS"
             print(f"[EVAL] {mark} {label}/{video.name}: predicted="
                   f"{row['predicted']} conf={row['confidence']:.2f} "
@@ -93,14 +111,20 @@ def main():
 
     print("\n=== RESULTS ===")
     for r in rows:
+        if not r["analyzed"]:
+            print(f"  UNAN {r['label']:8s} {r['clip']:40s} "
+                  f"failed_batches={r.get('failed_batches', '-')} {r.get('error', '')}")
+            continue
         mark = "ok  " if r["predicted"] == r["expected"] else "MISS"
         print(f"  {mark} {r['label']:8s} {r['clip']:40s} "
               f"pred={r['predicted']} conf={r['confidence']:.2f}")
     sens = metrics["sensitivity"]
     spec = metrics["specificity"]
-    print(f"clips={metrics['clips']}  "
+    print(f"clips={metrics['clips']}  unanalyzed={metrics['unanalyzed']}  "
           f"sensitivity={sens if sens is None else round(sens, 3)}  "
           f"specificity={spec if spec is None else round(spec, 3)}")
+    if metrics["unanalyzed"]:
+        print("unanalyzed (not scored):", ", ".join(metrics["unanalyzed_clips"]))
     print("written:", args.eval_root / "results.json")
 
 
