@@ -929,6 +929,33 @@ class TestResume:
         assert calls[:2] == [1, 2]
         assert out["final_abnormal_event"] is False
 
+    def test_other_batch_size_starts_fresh(self, monkeypatch, event_dir):
+        # The recorded verdicts cover other frames once the batches are cut
+        # differently; reusing them would leave frames never looked at.
+        self._kill_after(monkeypatch, event_dir, 2, lambda bi: _batch(bi == 1, 0.8))
+        monkeypatch.setattr(ve, "BATCH_SIZE", 10)
+        out, calls = self._rerun(monkeypatch, event_dir)
+        assert calls[:2] == [1, 2]
+        assert out["batch_size"] == 10
+
+    def test_login_error_on_rerun_keeps_a_later_recorded_positive(self, monkeypatch, event_dir):
+        # Batch 1 crashed, batch 2 found a positive, then the run was killed.
+        # The rerun asks batch 1 again and hits a login error: batch 2's
+        # positive must survive it, not turn into a failed batch.
+        self._kill_after(monkeypatch, event_dir, 2,
+                         lambda bi: (ve.failed_batch("boom", ve.ERR_CRASH) if bi == 1
+                                     else _batch(True, 0.8)))
+
+        def login_error(bi):
+            raise ve.ClaudeLoginError("Not logged in")
+
+        with pytest.raises(ve.ClaudeLoginError):
+            self._rerun(monkeypatch, event_dir, login_error)
+        out = self._read(event_dir)
+        assert out["complete"] is True
+        assert out["batches"][1]["abnormal_event"] is True
+        assert out["final_abnormal_event"] is True
+
     def test_complete_file_starts_fresh(self, monkeypatch, event_dir):
         self._rerun(monkeypatch, event_dir, lambda bi: _batch(bi == 1, 0.8))
         out, calls = self._rerun(monkeypatch, event_dir)
