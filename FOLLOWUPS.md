@@ -520,6 +520,44 @@ still unmeasured. In one grayscale run a batch was lost to malformed
 model JSON, which failed both attempts ("Expecting ',' delimiter"). The
 event still alerted from its other batches.
 
+**Two live false alarms and a re-check, 2026-09-26.** Two alerts on
+2026-09-25/26 were the dog rolling on its back (22:06) and lying down
+right in front of the lens as the camera switched from IR to colour
+(02:10). The model hedged both times ("could be voluntary rolling") and
+flagged them under "if torn, flag it". The first one came from a tail
+batch of 3 frames (0.2 s) that had no context. The batch before it had
+read the same roll as voluntary.
+
+Two fixes:
+- A short remainder is no longer sent as its own batch. The last batch
+  is the last 30 frames, overlapping the one before.
+- The prompt now states that rhythmic signs need to be seen for about
+  2 s of timestamps ("sustained" means that long). It also says the
+  on-screen clock is not evidence. The 02:10 reasoning had cited
+  "02:09 AM".
+
+The tail fix alone did not silence the 22:06 event (1 run). The duration
+rule did.
+
+| Event | Runs | Deployed code | With the fixes |
+|---|---|---|---|
+| Walking dog FA1 / FA2 | 1 each | silent | silent |
+| Back-roll at night (22:06) | 3 | alert | **silent 3/3** |
+| Lying down at the lens, IR (02:10) | 3 | alert | **silent 3/3** |
+| Real seizure, colour | 10 / 7 | **alert 8/10** | **alert 5/7** |
+| Real seizure, grayscale | 3 / 2 | alert 3/3 | alert 2/2 |
+
+**The real finding is that recall on the owner's seizure is a coin
+weighted about 3:1, not a certainty.** On the same batch-2 frames and
+the same prompt, the model sometimes flags "rapid limb motion ~3.3 s
+without righting, ambiguous" and sometimes calls it "a voluntary
+back-scratching roll". This dog's seizure looks like back-rolling to the
+model. The fixes do not change that (5/7 vs 8/10 is within noise at
+these sample sizes). Raising it needs more than prompt wording. Options:
+a second independent confirm call for recumbent batches it calls
+negative with low confidence (cost: extra calls on those batches only),
+or more real seizure footage to calibrate against.
+
 Also fixed in the same pass: `final_confidence` is now the confidence of
 the *finding* (max over positive batches) instead of the max over all
 analyzed batches — a normal event used to report 0.85, and the first false

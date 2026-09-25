@@ -74,6 +74,13 @@ or rolling while unable to right itself; repetitive jerking at roughly
 individual frames are blurred and even if the dog seems to move around
 the room between episodes - seizures start and stop.
 
+Duration matters for the rhythmic signs (paddling, rhythmic_jerking,
+head_tremor, jaw_clonus, muscle_twitching): read it from the frame
+timestamps. Movement seen for less than about 2 seconds is too short to
+call rhythmic - a seizure's rhythmic phase keeps going. "sustained" means
+it lasted at least that long. The on-screen clock is not evidence either
+way: dogs lie down and roll at night too.
+
 If you are genuinely torn between the two readings, flag it.
 """
 
@@ -105,8 +112,15 @@ def frame_time(path):
 
 
 def iter_batches(paths, batch_size):
+    """Consecutive batches. A short remainder is never sent on its own: it
+    becomes the last batch_size frames, overlapping the batch before. A
+    3-frame tail (0.2 s) has no context, and the model flagged a dog's
+    ordinary back-roll on one as "ambiguous" (false alarm, 2026-09-25 22:06)."""
     for i in range(0, len(paths), batch_size):
-        yield paths[i:i + batch_size]
+        batch = paths[i:i + batch_size]
+        if len(batch) < batch_size and i > 0:
+            batch = paths[-batch_size:]
+        yield batch
 
 
 def strip_fences(text):

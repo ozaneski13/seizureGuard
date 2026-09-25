@@ -45,8 +45,27 @@ class TestPureCore:
     def test_iter_batches(self):
         items = list(range(70))
         batches = list(ve.iter_batches(items, 30))
-        assert [len(b) for b in batches] == [30, 30, 10]
-        assert [x for b in batches for x in b] == items
+        assert [len(b) for b in batches] == [30, 30, 30]
+        assert batches[:2] == [items[:30], items[30:60]]
+        assert set(x for b in batches for x in b) == set(items)
+
+    def test_short_tail_is_never_a_batch_of_its_own(self):
+        """Regression (2026-09-25 22:06): a 3-frame tail, 0.2 s with no
+        context, turned a dog's back-roll into an alert. The tail now takes
+        the last full batch, overlapping the one before."""
+        items = list(range(63))
+        batches = list(ve.iter_batches(items, 30))
+        assert batches[-1] == items[33:63]
+        assert len(batches) == 3
+
+    def test_short_events_and_exact_multiples_are_unchanged(self):
+        assert list(ve.iter_batches(list(range(10)), 30)) == [list(range(10))]
+        assert [len(b) for b in ve.iter_batches(list(range(60)), 30)] == [30, 30]
+
+    def test_prompt_states_the_duration_rule(self):
+        prompt = ve.confirm_prompt([])
+        assert "less than about 2 seconds" in prompt
+        assert "on-screen clock is not evidence" in prompt
 
     def test_parse_json_verdict_plain(self):
         assert ve.parse_json_verdict('{"abnormal_event": false, "confidence": 0.1}') == {
