@@ -61,9 +61,20 @@ is saved as:
 Frames are resized so the longest side is 640 px (aspect preserved).
 
 Separately from the analysis sampling, the event's **full-rate frames
-(~15 fps) are saved as `event.mp4`** straight from the ring buffer — this
-recording is what alert clips are cut from, so the video you receive plays
-smoothly regardless of how sparsely the AI sampled the event.
+(~15 fps) become `event.mp4`**. At capture they are written, still as
+JPEGs, to the event's `ring/` folder (plain file writes, ~0.3 s for a 65 s
+event). The verification worker builds `event.mp4` from them and then
+deletes `ring/`. Alert clips are cut from this recording, so the video you
+receive plays smoothly however sparsely the AI sampled the event. An event
+that is still waiting when the monitor restarts gets its video anyway.
+
+Verification runs on a worker thread, so the camera is read the whole
+time an event is being checked. Each event dir records its progress:
+`event_meta.json` is written at capture, and `handled.json` once its alert
+has gone out (text, photo, clip, and whether Telegram accepted it). On
+startup the monitor finishes every event that it captured but did not get
+to handle, and resends every alert Telegram did not accept. A finished
+verdict is never asked for again.
 
 ### Step 3 — Pose gate (optional, local, free)
 
@@ -160,7 +171,9 @@ Tips learned the hard way: prefer the low-res substream (`subtype=1`) —
 it's the pipeline's working resolution and decodes almost for free; dropped
 streams reconnect automatically; if the stream stays dead for 60 s you get
 a "monitor blind" alert, repeated every 6 h while it stays dead, and a
-"monitor recovered" message when frames return.
+"monitor recovered" message when frames return. Any alert Telegram does
+not accept is retried every 60 s until it is delivered, including event
+alerts, and after a restart too.
 
 ### Step 2 — Connect the AI (choose one backend)
 
@@ -196,9 +209,10 @@ alerts.
    setx SEIZUREGUARD_TG_TOKEN "<bot token>"
    setx SEIZUREGUARD_TG_CHAT  "<chat id>"
 
-   # Linux / systemd service: add to the unit instead
-   #   Environment=SEIZUREGUARD_TG_TOKEN=...
-   #   Environment=SEIZUREGUARD_TG_CHAT=...
+   # Linux / systemd service: put them in a root-only env file and point
+   # the unit at it with EnvironmentFile= (plain Environment= values can
+   # be read by any local user via `systemctl show`); the Raspberry Pi
+   # setup in deploy/pi does exactly this.
    ```
 
 5. Test it — this should ping your phone:

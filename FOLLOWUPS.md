@@ -102,7 +102,10 @@ Standing constraints:
   (`/etc/systemd/system/seizureguard-*.service.d/telegram.conf`, mode
   600). End-to-end verified with a live-frame photo through
   `alerts.send_alert`. Rotation path: BotFather `/revoke`, then re-run
-  `~/setup-telegram.sh` on the Pi (prompts secretly, restarts services).
+  `deploy/pi/setup-telegram.sh` on the Pi (prompts secretly, restarts
+  services). Since 2026-09-25 the secrets live in root-only env files
+  under `/etc/seizureguard/`, referenced with `EnvironmentFile=`
+  (see deploy/pi/README.md); the old `~/setup-*.sh` copies are outdated.
 - **Camera session budget:** the Xiaomi cameras break above ~2 concurrent
   sessions. Pi holds one per camera (substream). Windows go2rtc grabs
   another only while its streams are consumed (PTZ panel iframe, tracker,
@@ -114,9 +117,11 @@ Standing constraints:
   `--no-session-persistence` (regression-tested) and the old transcripts
   deleted. (2) `data/events/` grows ~30 events/day (~3 GB/8 days);
   `scripts/prune_events.py` now runs daily (`seizureguard-prune.timer`,
-  04:20): keeps the 14 days before the newest event, **every
-  verifier-positive event forever** (training set), and one hard-negative
-  sample per camera per day forever; deletes the other older negatives.
+  04:20): per camera it keeps everything from that camera's 14 most
+  recent days with events, plus, forever, **every verifier-positive
+  event** (training set), every event that was not fully checked or whose
+  alert was not delivered, and one hard-negative sample per camera per
+  day; it deletes the other older negatives.
 - **CORRECTION — there is no live false-alarm figure yet.** An earlier
   note here read the ~230 captured events' `final_abnormal_event: false`
   as "the verifier rejected them". It did not: `failed_batches` equalled
@@ -161,8 +166,11 @@ Two detection gaps let it run for 20 days:
 And one data loss: `prune_events.py` keeps "the last 14 days" measured
 from *now*. With nothing new arriving, it deleted every negative from
 before the outage (129 events, 2026-09-15..18), leaving only the 4
-positives. **Fixed 2026-09-24:** the window is now measured back from the
-newest event, so a blind spell removes nothing (regression-tested).
+positives. **Fixed 2026-09-24, refined 2026-09-25:** the window is now
+counted in *active* days per camera (a camera's 14 most recent days with
+events). A blind spell removes nothing, neither during the gap nor right
+after it, and one blind camera is not eaten while the other keeps
+recording (regression-tested).
 
 **Why the monitors never recovered (found 2026-09-24, fixed in
 `3c82190`).** The camera drop-out was the trigger, not the reason the
@@ -185,11 +193,91 @@ fix has two layers:
   with `WatchdogSec=300` + `NotifyAccess=main`. A process that wedges
   anywhere in native code stops pinging and systemd restarts it within
   five minutes. The window must stay above the slowest unpinged startup
-  path (auth check 30 s + verify probe 120 s); `handle_event` pings from
-  a keepalive thread because verify can take minutes.
+  path (auth check 30 s + verify probe 120 s + its alert ~22 s). Since
+  2026-09-25 events are verified on a worker thread, so the main loop
+  keeps pinging during verification. It stops pinging only when one event
+  has been processing for more than 5400 s (pose 600 + verify 3600 +
+  margin), so a wedged worker is restarted too. Every abnormal stop is now
+  announced by `ExecStopPost=` in the same drop-in.
 
 The repeated blind alert (added the same day) covers the case the
 watchdog does not: a healthy loop staring at a stream that stays dead.
+
+## Review of the 2026-09-24/25 changes (two rounds, 33 confirmed findings)
+
+The first review, a multi-agent pass with three independent verifiers per
+finding, covered 7916f63..001bd38. It confirmed 19 findings. Most of them
+predated those commits. A second review then checked how the fixes
+interact and confirmed 14 more. Everything below is fixed and tested (363
+tests); commits c977ad1..6eb4fa7 plus the first round.
+
+**The worst one: the monitor did not watch while it verified.**
+`handle_event` ran inline in the read loop. For the minutes an event's
+verification took, no frame was read. A seizure that started during
+that window, after restlessness had triggered an event, went unseen, and
+nothing reported the gap. Events are now captured on the main thread and
+verified on one worker thread.
+
+Monitor:
+- An alert Telegram does not accept is retried every 60 s until it is
+  delivered. That covers event alerts too (the most important kind;
+  before, a positive was sent once and lost if the send failed), blind
+  alerts, outage and recovery notices, and the backlog alert.
+  `handled.json` records the text, photo and clip, so a restart resends
+  the alert without verifying again.
+- Restart recovery: events captured but not finished are processed on
+  startup, whatever their age and whether or not verify is on. A finished
+  `analysis.json` is reused, never re-verified; re-verifying risked
+  turning a borderline positive negative. Only dirs from the worker era
+  (with `event_meta.json`) are swept, so the first deploy does not
+  re-alert old events.
+- Full-rate frames are spilled to disk at capture, so queued events hold
+  no memory and a restart keeps their video.
+- If the stream stalls mid-motion, that event is captured right away,
+  before the ring evicts its frames.
+- A positive recovered from an unreadable model reply says "confidence
+  unknown" instead of "0.00". "Back online" goes out only after a real
+  verdict.
+
+Verifier:
+- The JSON parse is tolerant: it scans every `{`, retries without the
+  trailing `note` member, salvages a positive from the raw text, and
+  sends a repair prompt on the retry. The raw reply is kept on failure.
+  When a reply holds several verdict objects, a positive wins.
+- Unreadable sign evidence fails the batch (UNVERIFIED) instead of
+  scoring it as a clean negative.
+- Parse errors are never classified as a backend outage (a bare "429"
+  inside a JSON offset used to count as one). A login error is recorded
+  as an outage.
+- `analysis.json` is written atomically. A null confidence no longer
+  crashes the run.
+
+Archive and eval:
+- The viewer shows events that were not fully checked as KARARSIZ, never
+  as grey "negatif". The header counts them on every view.
+- The explanation shown for a positive comes from a positive batch.
+- `eval_clips` reports unanalysed clips separately.
+- Prune keeps unchecked, unfinished and undelivered events forever and
+  counts retention in active days per camera.
+
+Ops:
+- Abnormal monitor stops are announced by `ExecStopPost`.
+- Secrets moved from `Environment=` into root-only env files, because
+  `systemctl show` hands `Environment=` values to any local user.
+  `deploy/pi/migrate-secrets.sh` converts an existing install.
+- Token setup validates in an isolated config dir, so it cannot break a
+  working verifier.
+- `deploy-pi.ps1` stages, compiles and imports the files first. It waits
+  until no event is in flight and fails loudly on any error.
+
+Deliberately left open:
+- An `ExecStopPost` alert has no rate limit. A monitor that crash-loops at
+  startup would page every ~11 s. The deploy's import check makes that
+  unlikely.
+- The ~172 s before the first systemd ping at startup is still unpinged
+  (under WatchdogSec=300).
+- A reply whose `observed_signs` is a list of bare strings is still
+  skipped silently rather than failed.
 
 ## Silent verification outage (found 2026-08-22, the project's worst bug)
 
