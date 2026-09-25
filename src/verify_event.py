@@ -3,10 +3,18 @@ to the confirm model, which assesses specific canine seizure signs; a
 deterministic rule layer decides, recall-first. Writes analysis.json into
 the event dir.
 
+Per-batch keys besides the verdict: a failed batch (abnormal_event None)
+carries `error` and `error_kind` - "parse" (the model replied but no verdict
+could be read; the error holds the first 2000 chars of the reply), "call"
+(the CLI/API call failed; only these can be a backend outage) or "crash"
+(an unexpected exception here). `salvaged: true` with `raw_reply` marks a
+positive read out of an unparseable reply; its confidence is 0.0.
+
 Usage: python src/verify_event.py <event_dir>
 """
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -102,12 +110,77 @@ def strip_fences(text):
     return text
 
 
+RAW_EXCERPT_CHARS = 2000
+SALVAGED_CONFIDENCE = 0.0
+
+
+class VerdictParseError(ValueError):
+    """The model replied, but no verdict could be read from the reply.
+    Event-level by origin: never a backend outage, whatever the text says."""
+
+    def __init__(self, reason, raw):
+        super().__init__(f"Unparseable model reply ({reason}): {raw[:RAW_EXCERPT_CHARS]}")
+        self.reason = reason
+
+
+def _find_verdict(text):
+    """First JSON object in text that carries a verdict, trying every '{'
+    so prose around the object (even prose with braces) does not matter.
+    Returns (verdict or None, first decode error or None). A lone sign
+    entry is not a verdict: taking one from a broken reply reads as a
+    clean negative."""
+    decoder = json.JSONDecoder()
+    first_error = None
+    for m in re.finditer(r"\{", text):
+        try:
+            obj, _ = decoder.raw_decode(text, m.start())
+        except json.JSONDecodeError as e:
+            first_error = first_error or e
+            continue
+        if isinstance(obj, dict) and ("abnormal_event" in obj or "observed_signs" in obj):
+            return obj, None
+    return None, first_error
+
+
+def _salvage(text):
+    """Recall-first last resort for a reply that does not parse: the signs
+    readable in the raw text, as a verdict the rule layer sees as positive,
+    or None when they would not be positive."""
+    present = []
+    for entry in re.findall(r"\{[^{}]*\}", text):
+        sign = re.search(r'"sign"\s*:\s*"([a-z_]+)"', entry)
+        if (sign and sign.group(1) in ALL_SIGNS and sign.group(1) not in present
+                and re.search(r'"present"\s*:\s*true', entry)):
+            present.append(sign.group(1))
+    verdict = {
+        "abnormal_event": bool(re.search(r'"abnormal_event"\s*:\s*true', text)),
+        "confidence": SALVAGED_CONFIDENCE,
+        "observed_signs": [{"sign": s, "present": True} for s in present],
+        "note": "salvaged from an unparseable model reply",
+        "salvaged": True,
+        "raw_reply": text[:RAW_EXCERPT_CHARS],
+    }
+    return verdict if decide_signs(verdict) else None
+
+
 def parse_json_verdict(text):
+    """Verdict dict from the model's reply. Three live failures (2026-09-02,
+    the grayscale run, 2026-09-25) were unescaped double quotes in the
+    free-text note, the schema's last member; a strict parse of the whole
+    reply threw away the decisive fields before it. So: parse leniently,
+    then retry without the note, then salvage a positive from the raw text.
+    Raises VerdictParseError when nothing usable is left."""
     cleaned = strip_fences(text)
-    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if not m:
-        raise ValueError(f"No JSON object in model output: {text[:200]!r}")
-    return json.loads(m.group(0))
+    verdict, error = _find_verdict(cleaned)
+    if verdict is None:
+        note = re.search(r',?\s*"note"\s*:', cleaned)
+        if note:
+            verdict, _ = _find_verdict(cleaned[:note.start()].rstrip() + "}")
+    if verdict is None:
+        verdict = _salvage(text)
+    if verdict is None:
+        raise VerdictParseError(str(error) if error else "no JSON verdict object", text)
+    return verdict
 
 
 # Failures that mean "the backend is unavailable right now" rather than
@@ -117,7 +190,7 @@ BACKEND_OUTAGE_MARKERS = (
     "hit your limit",
     "usage limit",
     "rate limit",
-    "429",
+    "too many requests",
     "quota",
     "overloaded",
     "not logged in",
@@ -125,13 +198,26 @@ BACKEND_OUTAGE_MARKERS = (
     "authenticate",
 )
 
+# Batch "error_kind": where a failure came from. Only a failed call can be
+# a backend outage; a reply that did not parse, or a crash in this script,
+# is about this event. Batches written before the field existed have none.
+ERR_PARSE, ERR_CALL, ERR_CRASH = "parse", "call", "crash"
 
-def is_backend_outage(error_text):
+
+def error_kind(exc):
+    return ERR_PARSE if isinstance(exc, (VerdictParseError, json.JSONDecodeError)) else ERR_CALL
+
+
+def is_backend_outage(error_text, kind=None):
     """True when an error means the whole backend is down, not this event."""
-    if not error_text:
+    if not error_text or kind not in (None, ERR_CALL):
         return False
     low = str(error_text).lower()
-    return any(m in low for m in BACKEND_OUTAGE_MARKERS)
+    if any(m in low for m in BACKEND_OUTAGE_MARKERS):
+        return True
+    # A bare "429" also matched JSON offsets ("char 1429"); trust it only
+    # in the CLI's own error text.
+    return low.startswith("claude cli") and re.search(r"\b429\b", low) is not None
 
 
 def outage_reason(batch_results):
@@ -141,11 +227,28 @@ def outage_reason(batch_results):
         if r.get("abnormal_event") is not None:
             continue
         err = r.get("error") or (r.get("screen_verdict") or {}).get("error")
-        if is_backend_outage(err):
+        if is_backend_outage(err, r.get("error_kind")):
             reasons.append(str(err))
     if not reasons:
         return None
     return max(set(reasons), key=reasons.count)[:200]
+
+
+def coerce_confidence(value):
+    """The model's confidence as a float in [0, 1]; null, text or NaN is 0.0."""
+    try:
+        c = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(c):
+        return 0.0
+    return min(max(c, 0.0), 1.0)
+
+
+def failed_batch(error, kind):
+    return {"abnormal_event": None, "confidence": 0.0, "screen_verdict": None,
+            "escalated": True, "observed_signs": [], "error": error,
+            "error_kind": kind}
 
 
 def decide_signs(verdict):
@@ -267,19 +370,29 @@ def run_claude(prompt, model, images, timeout=300):
 
 
 def _with_retry(fn, batch_index, tier, attempts):
+    """fn(previous_exception) -> result; previous_exception is None on the
+    first attempt. Returns (result, None) or (None, last exception)."""
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
-            return fn(), None
+            return fn(last_error), None
         except ClaudeLoginError:
             raise
         except Exception as e:
-            last_error = str(e)
+            last_error = e
             print(f"[WARN] Batch {batch_index} {tier} attempt {attempt}/{attempts} failed: {e}",
                   flush=True)
             if attempt < attempts:
                 time.sleep(2 ** attempt)
     return None, last_error
+
+
+def repair_instruction(error):
+    """Appended to a retry after an unparseable reply: resending the same
+    prompt let the same habit (inner quotes in the note) fail again."""
+    return ("\n\nYour previous reply to this request was not valid JSON "
+            f"({error.reason}). Return only one valid JSON object. Never put "
+            "double quotes inside string values; use single quotes there instead.")
 
 
 def assess_batch_claude(event_dir, paths, config, batch_index):
@@ -293,23 +406,18 @@ def assess_batch_claude(event_dir, paths, config, batch_index):
     viewer shows - a wrong explanation on exactly the events that matter.
     Do not reintroduce a cheap pre-filter without re-running the reference
     events in FOLLOWUPS. `screen_verdict` stays in analysis.json as None."""
-    confirm, confirm_error = _with_retry(
-        lambda: run_claude(confirm_prompt(paths), config["confirm_model"],
-                           images=paths, timeout=600),
-        batch_index, "confirm", CONFIRM_ATTEMPTS,
-    )
+    def attempt(previous_error):
+        prompt = confirm_prompt(paths)
+        if isinstance(previous_error, VerdictParseError):
+            prompt += repair_instruction(previous_error)
+        return run_claude(prompt, config["confirm_model"], images=paths, timeout=600)
+
+    confirm, confirm_error = _with_retry(attempt, batch_index, "confirm", CONFIRM_ATTEMPTS)
     if confirm is None:
-        return {
-            "abnormal_event": None,
-            "confidence": 0.0,
-            "screen_verdict": None,
-            "escalated": True,
-            "observed_signs": [],
-            "error": confirm_error,
-        }
-    return {
+        return failed_batch(str(confirm_error), error_kind(confirm_error))
+    result = {
         "abnormal_event": decide_signs(confirm),
-        "confidence": float(confirm.get("confidence", 0.0)),
+        "confidence": coerce_confidence(confirm.get("confidence")),
         "screen_verdict": None,
         "escalated": True,
         "observed_signs": confirm.get("observed_signs") or [],
@@ -317,6 +425,10 @@ def assess_batch_claude(event_dir, paths, config, batch_index):
         "partially_visible": confirm.get("partially_visible"),
         "note": confirm.get("note"),
     }
+    if confirm.get("salvaged"):
+        result["salvaged"] = True
+        result["raw_reply"] = confirm.get("raw_reply")
+    return result
 
 
 # ---------------------------------------------------------- openai backend
@@ -380,15 +492,14 @@ def ask_openai(client, event_dir, paths, model):
 
 def assess_batch_openai(client, event_dir, paths, config, batch_index):
     verdict, error = _with_retry(
-        lambda: ask_openai(client, event_dir, paths, config["openai_model"]),
+        lambda _previous: ask_openai(client, event_dir, paths, config["openai_model"]),
         batch_index, "confirm", MAX_ATTEMPTS,
     )
     if verdict is None:
-        return {"abnormal_event": None, "confidence": 0.0, "screen_verdict": None,
-                "escalated": True, "observed_signs": [], "error": error}
+        return failed_batch(str(error), error_kind(error))
     return {
         "abnormal_event": decide_signs(verdict),
-        "confidence": float(verdict.get("confidence", 0.0)),
+        "confidence": coerce_confidence(verdict.get("confidence")),
         "screen_verdict": None,
         "escalated": True,
         "observed_signs": verdict.get("observed_signs") or [],
@@ -440,7 +551,15 @@ def main():
 
     batch_results = []
     for bi, batch in enumerate(iter_batches(frames, BATCH_SIZE), start=1):
-        r = assess(batch, bi)
+        # One odd reply must not kill the run: analysis.json would never be
+        # written and the other batches' positives would be lost with it.
+        try:
+            r = assess(batch, bi)
+        except ClaudeLoginError:
+            raise
+        except Exception as e:
+            print(f"[WARN] Batch {bi} crashed: {type(e).__name__}: {e}", flush=True)
+            r = failed_batch(f"{type(e).__name__}: {e}", ERR_CRASH)
         batch_results.append(r)
         print(f"[INFO] Batch {bi}: abnormal={r['abnormal_event']} "
               f"conf={r['confidence']:.2f} escalated={r['escalated']}", flush=True)

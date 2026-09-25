@@ -47,12 +47,12 @@ class TestPureCore:
         assert [x for b in batches for x in b] == items
 
     def test_parse_json_verdict_plain(self):
-        assert ve.parse_json_verdict('{"seen": "no", "confidence": 0.1}') == {
-            "seen": "no", "confidence": 0.1}
+        assert ve.parse_json_verdict('{"abnormal_event": false, "confidence": 0.1}') == {
+            "abnormal_event": False, "confidence": 0.1}
 
     def test_parse_json_verdict_fenced(self):
-        text = 'Here you go:\n```json\n{"seen": "yes", "confidence": 0.8}\n```'
-        assert ve.parse_json_verdict(text)["seen"] == "yes"
+        text = 'Here you go:\n```json\n{"abnormal_event": true, "confidence": 0.8}\n```'
+        assert ve.parse_json_verdict(text)["abnormal_event"] is True
 
     def test_parse_json_verdict_prose_wrapped(self):
         text = 'The answer is {"abnormal_event": false, "confidence": 0.2} as requested.'
@@ -61,6 +61,85 @@ class TestPureCore:
     def test_parse_json_verdict_garbage_raises(self):
         with pytest.raises(ValueError):
             ve.parse_json_verdict("I cannot read these images")
+
+
+def _confirm_reply(present=(), abnormal=False, indent=None,
+                   note='dog on its side, legs "paddling" rhythmically'):
+    """A full 10-sign confirm reply the way the model writes it: the note,
+    the schema's last member, carries unescaped inner quotes."""
+    signs = [{"sign": s, "present": s in present,
+              "body_region": "legs" if s in present else "none",
+              "sustained": s in present} for s in ve.ALL_SIGNS]
+    body = json.dumps({"abnormal_event": abnormal, "confidence": 0.85,
+                       "posture": "lying_lateral", "partially_visible": False,
+                       "observed_signs": signs}, indent=indent)
+    sep = "\n  " if indent else " "
+    return body[:-1].rstrip() + f',{sep}"note": "{note}"' + ("\n}" if indent else "}")
+
+
+class TestTolerantParse:
+    """Regression: a strict parse over the whole reply lost confirm verdicts
+    to a flaw in the free-text note (live 2026-09-02 and 2026-09-25: both
+    attempts failed with "Expecting ',' delimiter", a positive batch among them)."""
+
+    def test_inner_quotes_in_note_keep_a_positive_verdict(self):
+        text = _confirm_reply(present=("paddling", "loss_of_posture"), abnormal=True)
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(text)                       # the realistic failure
+        v = ve.parse_json_verdict(text)
+        assert v["abnormal_event"] is True
+        assert ve.decide_signs(v) is True
+        assert len(v["observed_signs"]) == len(ve.ALL_SIGNS)
+        assert not v.get("salvaged")
+
+    def test_inner_quotes_in_note_keep_a_negative_verdict(self):
+        text = _confirm_reply(indent=2, note='dog "settling" down to rest')
+        v = ve.parse_json_verdict(text)
+        assert v["abnormal_event"] is False
+        assert ve.decide_signs(v) is False
+
+    def test_trailing_prose_with_braces(self):
+        body = json.dumps({"abnormal_event": True, "confidence": 0.7,
+                           "observed_signs": []})
+        text = body + "\n\n(Signs evaluated: {paddling, jaw_clonus}.)"
+        assert ve.parse_json_verdict(text)["abnormal_event"] is True
+
+    def test_nested_sign_object_is_not_taken_for_the_verdict(self):
+        # Broken outer object, parseable inner sign entries: returning a sign
+        # entry would read as a clean negative.
+        text = _confirm_reply(present=("drooling",)).replace(
+            '"posture": "lying_lateral"', '"posture": "lying "lateral""')
+        with pytest.raises(ValueError):
+            ve.parse_json_verdict(text)
+
+    def test_object_without_a_verdict_is_a_failure_not_a_negative(self):
+        with pytest.raises(ValueError):
+            ve.parse_json_verdict('{"error": "images unreadable"}')
+
+    def test_unparseable_positive_is_salvaged(self):
+        # The quote damage sits inside a sign entry, so dropping the note
+        # does not help; the hard sign is still readable.
+        text = _confirm_reply(present=("paddling",)).replace(
+            '"body_region": "legs"', '"body_region": "front "left" leg"')
+        v = ve.parse_json_verdict(text)
+        assert v["salvaged"] is True
+        assert ve.decide_signs(v) is True
+        assert v["confidence"] <= 0.1
+        assert text[:100] in v["raw_reply"]
+
+    def test_truncated_reply_with_abnormal_flag_is_salvaged(self):
+        text = '{"abnormal_event": true, "confidence": 0.9, "observed_signs": [{"sign": "padd'
+        v = ve.parse_json_verdict(text)
+        assert v["salvaged"] is True
+        assert ve.decide_signs(v) is True
+
+    def test_unsalvageable_failure_keeps_the_raw_reply(self):
+        text = _confirm_reply(present=("drooling",)).replace(
+            '"body_region": "legs"', '"body_region": "the "muzzle""')
+        with pytest.raises(ValueError) as exc:
+            ve.parse_json_verdict(text)
+        assert "Expecting" in str(exc.value)
+        assert text[:1500] in str(exc.value)
 
 
 class TestSignRules:
@@ -114,14 +193,14 @@ class TestRunClaude:
 
     def test_parses_result_event(self, monkeypatch):
         monkeypatch.setattr(ve.subprocess, "run", lambda *a, **k: self._proc(
-            self._stream('{"seen": "no", "confidence": 0.1}')))
+            self._stream('{"abnormal_event": false, "confidence": 0.1}')))
         out = ve.run_claude("prompt", "haiku", images=[])
-        assert out == {"seen": "no", "confidence": 0.1}
+        assert out == {"abnormal_event": False, "confidence": 0.1}
 
     def test_fenced_result_is_cleaned(self, monkeypatch):
         monkeypatch.setattr(ve.subprocess, "run", lambda *a, **k: self._proc(
-            self._stream('```json\n{"seen": "yes", "confidence": 0.9}\n```')))
-        assert ve.run_claude("p", "m", images=[])["seen"] == "yes"
+            self._stream('```json\n{"abnormal_event": true, "confidence": 0.9}\n```')))
+        assert ve.run_claude("p", "m", images=[])["abnormal_event"] is True
 
     def test_images_are_embedded_as_base64(self, monkeypatch, tmp_path):
         frame = tmp_path / "frame_000_t_1.000s.jpg"
@@ -131,7 +210,7 @@ class TestRunClaude:
         def fake(cmd, **kwargs):
             captured["cmd"] = cmd
             captured["stdin"] = kwargs.get("input")
-            return self._proc(self._stream('{"seen": "no", "confidence": 0.0}'))
+            return self._proc(self._stream('{"abnormal_event": false, "confidence": 0.0}'))
 
         monkeypatch.setattr(ve.subprocess, "run", fake)
         ve.run_claude("p", "m", images=[frame])
@@ -342,6 +421,36 @@ class TestBackendOutageClassification:
         assert ve.is_backend_outage("Expecting ',' delimiter: line 1 column 1009") is False
         assert ve.is_backend_outage(None) is False
 
+    def test_parse_offset_containing_429_is_not_an_outage(self):
+        # Regression: the bare "429" marker matched JSON offsets.
+        err = "Expecting ',' delimiter: line 1 column 1430 (char 1429)"
+        assert ve.is_backend_outage(err) is False
+        assert ve.is_backend_outage("Expecting ',' delimiter: line 9 column 5 (char 429)",
+                                    kind="parse") is False
+
+    def test_parse_kind_is_never_an_outage(self):
+        err = "Unparseable model reply: I can't authenticate this; quota of frames overloaded"
+        assert ve.is_backend_outage(err, kind="parse") is False
+        batches = [{"abnormal_event": None, "error": err, "error_kind": "parse"}]
+        assert ve.outage_reason(batches) is None
+
+    def test_cli_rate_limits_are_outages(self):
+        assert ve.is_backend_outage(
+            'claude CLI error: API Error: 429 {"type":"error","error":'
+            '{"type":"rate_limit_error"}}', kind="call")
+        assert ve.is_backend_outage("Error code: 429 - Too Many Requests", kind="call")
+        assert ve.is_backend_outage("claude CLI error: You've hit your limit", kind="call")
+
+    def test_crash_kind_is_not_an_outage(self):
+        batches = [{"abnormal_event": None, "error_kind": "crash",
+                    "error": "TypeError: 'NoneType' has no attribute 'quota'"}]
+        assert ve.outage_reason(batches) is None
+
+    def test_legacy_batches_without_kind_still_classify(self):
+        batches = [{"abnormal_event": None,
+                    "error": "claude CLI error: You've hit your limit"}]
+        assert "hit your limit" in ve.outage_reason(batches)
+
     def test_reason_taken_from_failed_batches_only(self):
         batches = [
             {"abnormal_event": False, "confidence": 0.1},
@@ -353,3 +462,130 @@ class TestBackendOutageClassification:
     def test_no_outage_when_failures_are_local(self):
         batches = [{"abnormal_event": None, "error": "JSON parse failed"}]
         assert ve.outage_reason(batches) is None
+
+
+def _cli_reply(result_text):
+    """subprocess.run stand-in: the CLI answered with this model text."""
+    stdout = json.dumps({"type": "result", "is_error": False, "result": result_text})
+    return lambda *a, **k: types.SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+
+
+class TestParseFailureRetry:
+    """Regression: the 2nd attempt resent the identical prompt, so a model
+    habit (inner quotes) failed both attempts the same way."""
+
+    def _prompts(self, monkeypatch, first_error):
+        prompts = []
+
+        def fake(prompt, model, images, timeout=600):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                raise first_error
+            return {"abnormal_event": False, "confidence": 0.2, "observed_signs": []}
+
+        monkeypatch.setattr(ve, "run_claude", fake)
+        r = ve.assess_batch_claude(None, [], ve.get_config(), 1)
+        assert r["abnormal_event"] is False
+        return prompts
+
+    def test_retry_after_parse_failure_asks_for_repair(self, monkeypatch):
+        err = ve.VerdictParseError("Expecting ',' delimiter: line 1 column 1047 (char 1046)",
+                                   '{"abnormal_event": false, "note": "a "b""}')
+        first, second = self._prompts(monkeypatch, err)
+        assert second != first
+        assert second.startswith(first)
+        assert "Expecting ',' delimiter: line 1 column 1047" in second
+        assert "never put double quotes inside string values" in second.lower()
+        assert '"note": "a "b""' not in second      # the reason, not the whole reply
+
+    def test_retry_after_call_failure_is_unchanged(self, monkeypatch):
+        first, second = self._prompts(monkeypatch, RuntimeError("claude CLI error: boom"))
+        assert second == first
+
+    def test_failed_batch_keeps_raw_reply_and_parse_kind(self, monkeypatch):
+        text = _confirm_reply(present=("drooling",)).replace(
+            '"body_region": "legs"', '"body_region": "the "muzzle""')
+        monkeypatch.setattr(ve.subprocess, "run", _cli_reply(text))
+        r = ve.assess_batch_claude(None, [], ve.get_config(), 1)
+        assert r["abnormal_event"] is None
+        assert r["error_kind"] == "parse"
+        assert text[:1500] in r["error"]
+
+    def test_prose_reply_is_a_parse_failure_not_an_outage(self, monkeypatch):
+        monkeypatch.setattr(ve.subprocess, "run", _cli_reply(
+            "I can't authenticate what is happening here - the quota of usable "
+            "frames is low and the scene is overloaded, but the dog is thrashing."))
+        r = ve.assess_batch_claude(None, [], ve.get_config(), 1)
+        assert r["abnormal_event"] is None
+        assert r["error_kind"] == "parse"
+        assert ve.outage_reason([r]) is None
+
+    def test_cli_outage_is_still_an_outage(self, monkeypatch):
+        stdout = json.dumps({"type": "result", "is_error": True,
+                             "result": "You've hit your limit · resets Sep 5"})
+        monkeypatch.setattr(ve.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
+            stdout=stdout, stderr="", returncode=1))
+        r = ve.assess_batch_claude(None, [], ve.get_config(), 1)
+        assert r["error_kind"] == "call"
+        assert "hit your limit" in ve.outage_reason([r])
+
+    def test_salvaged_positive_marks_the_batch(self, monkeypatch):
+        text = _confirm_reply(present=("paddling",)).replace(
+            '"body_region": "legs"', '"body_region": "front "left" leg"')
+        monkeypatch.setattr(ve.subprocess, "run", _cli_reply(text))
+        r = ve.assess_batch_claude(None, [], ve.get_config(), 1)
+        assert r["abnormal_event"] is True
+        assert r["salvaged"] is True
+        assert text[:100] in r["raw_reply"]
+
+
+class TestValueCoercion:
+    """Regression: a null or non-numeric confidence crashed verify_event
+    after the verdict was in, losing every batch including positives."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        (None, 0.0), ("high", 0.0), ([0.5], 0.0), (float("nan"), 0.0),
+        ("0.8", 0.8), (1.7, 1.0), (-0.3, 0.0), (0.45, 0.45),
+    ])
+    def test_claude_confidence_is_coerced(self, monkeypatch, raw, expected):
+        monkeypatch.setattr(ve, "run_claude", lambda *a, **k: {
+            "abnormal_event": True, "confidence": raw, "observed_signs": []})
+        r = ve.assess_batch_claude(None, [], ve.get_config(), 1)
+        assert r["abnormal_event"] is True
+        assert r["confidence"] == expected
+
+    def test_openai_confidence_is_coerced(self, monkeypatch):
+        monkeypatch.setattr(ve, "ask_openai", lambda *a, **k: {
+            "abnormal_event": True, "confidence": None, "observed_signs": []})
+        r = ve.assess_batch_openai(None, None, [], ve.get_config(), 1)
+        assert r["abnormal_event"] is True
+        assert r["confidence"] == 0.0
+
+
+class TestBatchGuard:
+    def test_unexpected_batch_crash_keeps_other_batches(
+            self, monkeypatch, synthetic_event_dir):
+        def assess(event_dir, paths, config, bi):
+            if bi == 2:
+                raise TypeError("unexpected")
+            return {"abnormal_event": True, "confidence": 0.9, "screen_verdict": None,
+                    "escalated": True, "observed_signs": []}
+
+        monkeypatch.setattr(ve, "assess_batch_claude", assess)
+        out = _run_main(monkeypatch, synthetic_event_dir)
+        assert out["final_abnormal_event"] is True
+        assert out["failed_batches"] == 1
+        crashed = out["batches"][1]
+        assert crashed["abnormal_event"] is None
+        assert crashed["error_kind"] == "crash"
+        assert "TypeError" in crashed["error"]
+        assert out["backend_outage"] is None
+
+    def test_login_error_still_aborts_the_run(self, monkeypatch, synthetic_event_dir):
+        def assess(event_dir, paths, config, bi):
+            raise ve.ClaudeLoginError("not logged in")
+
+        monkeypatch.setattr(ve, "assess_batch_claude", assess)
+        monkeypatch.setattr(sys, "argv", ["verify_event.py", str(synthetic_event_dir)])
+        with pytest.raises(ve.ClaudeLoginError):
+            ve.main()
