@@ -296,8 +296,11 @@ def index_html(items, sort_mode, only):
         return ('<a class="' + on.strip() + '" href="/?sort=' + s + '&only=' + o + '">'
                 + label + '</a>')
 
+    # sayac tum arsivden: "Sadece pozitif" kararsizlari gizler, sayisini gizlememeli
     pos = sum(1 for e in items if e["verdict"] is True)
     unk = sum(1 for e in items if e["unchecked"])
+    shown = sort_items([e for e in items if e["verdict"] is True] if only == "pos" else items,
+                       sort_mode)
     head = ["<h1>seizureGuard olay arsivi</h1>",
             '<div class="sub">', str(len(items)), " olay &middot; ", str(pos),
             " pozitif &middot; ", str(unk), " kararsiz &middot; confidence = modelin kendi kararindan emin olma derecesi, ",
@@ -310,8 +313,8 @@ def index_html(items, sort_mode, only):
             link("Hepsi", sort_mode, "all"),
             link("Sadece pozitif", sort_mode, "pos"),
             "</div>"]
-    grid = ['<div class="grid">'] + [card_html(e) for e in items] + ["</div>"]
-    if not items:
+    grid = ['<div class="grid">'] + [card_html(e) for e in shown] + ["</div>"]
+    if not shown:
         grid = ['<div class="sub">Bu filtrede olay yok.</div>']
     return page("seizureGuard olaylari", "".join(head + grid))
 
@@ -414,8 +417,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             sort_mode = (q.get("sort") or ["default"])[0]
             only = (q.get("only") or ["all"])[0]
-            shown = [e for e in items if e["verdict"] is True] if only == "pos" else items
-            return self._send(200, index_html(sort_items(shown, sort_mode), sort_mode, only),
+            return self._send(200, index_html(items, sort_mode, only),
                               "text/html; charset=utf-8")
 
         if path == "/api/events":

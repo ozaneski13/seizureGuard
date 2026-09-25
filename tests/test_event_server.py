@@ -108,6 +108,22 @@ class TestUnchecked:
         page = event_server.index_html(event_server.scan_events(tmp_path), "default", "all")
         assert "1 kararsiz" in page
 
+    def test_missing_or_corrupt_analysis_is_not_negative(self, tmp_path):
+        # verify crashed or is still running: no verdict is not a negative one
+        (tmp_path / "event_20260902_100000_a").mkdir()
+        bad = tmp_path / "event_20260902_110000_a"
+        bad.mkdir()
+        (bad / "analysis.json").write_text("{truncated", encoding="utf-8")
+        _event(tmp_path, "event_20260903_100000_a", False, 0.96)
+        _event(tmp_path, "event_20260801_100000_a", True, 0.55)
+        items = {e["id"]: e for e in event_server.scan_events(tmp_path)}
+        for eid in ("event_20260902_100000_a", "event_20260902_110000_a"):
+            assert items[eid]["unchecked"] is True
+            assert '<span class="b unk">KARARSIZ</span>' in event_server.badge(items[eid])
+        order = [e["id"] for e in event_server.sort_items(list(items.values()), "default")]
+        assert order[0] == "event_20260801_100000_a"
+        assert order[-1] == "event_20260903_100000_a"
+
 
 class TestPeakNote:
     def test_top_level_note_wins(self):
@@ -159,6 +175,29 @@ def test_video_range_request_returns_partial_content(tmp_path):
             assert r.status == 206
             assert r.headers["Content-Range"] == "bytes 100-199/%d" % len(payload)
             assert r.read() == payload[100:200]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_positives_filter_still_counts_unchecked_in_header(tmp_path):
+    # the "Sadece pozitif" view hides undecided events, so its header must
+    # still say how many exist instead of a false "0 kararsiz"
+    _event(tmp_path, "event_20260901_100000_a", True, 0.8)
+    _event(tmp_path, "event_20260901_110000_a", False, 0.9, failed_batches=1,
+           batches=[{"abnormal_event": False}, {"abnormal_event": None}])
+    _event(tmp_path, "event_20260901_120000_a", False, 0.9)
+    event_server.Handler.root = tmp_path
+    event_server.Handler.thumbs = tmp_path / "thumbs"
+    event_server._index_cache.update(stamp=0.0, items=[])
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), event_server.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = "http://127.0.0.1:%d/?sort=default&only=pos" % srv.server_address[1]
+        with urllib.request.urlopen(url, timeout=10) as r:
+            page = r.read().decode("utf-8")
+        assert "3 olay &middot; 1 pozitif &middot; 1 kararsiz" in page
+        assert "event_20260901_110000_a" not in page
     finally:
         srv.shutdown()
         srv.server_close()

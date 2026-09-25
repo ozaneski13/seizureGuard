@@ -90,6 +90,28 @@ class TestEvaluateClip:
         assert row["analyzed"] is False
         assert row["predicted"] is None
 
+    @pytest.mark.parametrize("partial", [
+        {"failed_batches": 1},
+        {"failed_batches": 2, "backend_outage": "401 OAuth access token has expired"},
+    ])
+    def test_positive_with_failed_batches_is_analyzed(self, synthetic_video, tmp_path,
+                                                      partial):
+        # verdict is an OR over batches: a failed batch cannot undo a positive,
+        # so dropping it from sensitivity would hide a caught seizure
+        stub = tmp_path / "stub_verify.py"
+        stub.write_text(textwrap.dedent("""
+            import json, sys
+            from pathlib import Path
+            out = {"final_abnormal_event": True, "final_confidence": 0.8}
+            out.update(json.loads(sys.argv[1]))
+            (Path(sys.argv[2]) / "analysis.json").write_text(json.dumps(out))
+        """), encoding="utf-8")
+        row = eval_clips.evaluate_clip(
+            synthetic_video, tmp_path / "work",
+            verify_cmd=[sys.executable, str(stub), json.dumps(partial)])
+        assert row["analyzed"] is True
+        assert row["predicted"] is True
+
 
 def test_main_reports_unanalyzed_clips(tmp_path, monkeypatch, capsys):
     for label, name in (("seizure", "fit.mp4"), ("normal", "walk.mp4"),
