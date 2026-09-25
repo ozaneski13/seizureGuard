@@ -125,6 +125,60 @@ class TestUnchecked:
         assert order[-1] == "event_20260903_100000_a"
 
 
+class TestUnknownConfidence:
+    """Regression: a positive whose confidence was salvaged (a 0.0 marker) or
+    coerced from null showed '0.00' and sorted below every negative."""
+
+    def _items(self, root):
+        _event(root, "event_20260901_100000_a", True, 0.0, batches=[
+            {"abnormal_event": True, "confidence": 0.0, "salvaged": True}])
+        _event(root, "event_20260901_110000_a", True, None)
+        _event(root, "event_20260901_120000_a", False, 0.95)
+        _event(root, "event_20260901_130000_a", True, 0.4)
+        return {e["id"]: e for e in event_server.scan_events(root)}
+
+    def test_unknown_confidence_is_not_printed_as_zero(self, tmp_path):
+        items = self._items(tmp_path)
+        for eid in ("event_20260901_100000_a", "event_20260901_110000_a"):
+            e = items[eid]
+            assert e["confidence"] is None
+            assert '<span class="conf">?</span>' in event_server.card_html(e)
+            detail = event_server.detail_html(e)
+            assert "bilinmiyor" in detail and "0.00" not in detail
+        assert items["event_20260901_130000_a"]["confidence"] == 0.4
+
+    def test_confidence_sort_puts_unknown_positives_on_top(self, tmp_path):
+        order = [e["id"] for e in event_server.sort_items(
+            list(self._items(tmp_path).values()), "conf")]
+        assert order == ["event_20260901_110000_a", "event_20260901_100000_a",
+                         "event_20260901_120000_a", "event_20260901_130000_a"]
+
+    def test_zero_confidence_negative_stays_a_number(self, tmp_path):
+        _event(tmp_path, "event_20260901_100000_a", False, 0.0)
+        e = event_server.scan_events(tmp_path)[0]
+        assert e["confidence"] == 0.0
+        assert '<span class="conf">0.00</span>' in event_server.card_html(e)
+
+
+class TestIncompleteAnalysis:
+    """verify_event writes analysis.json after every batch; a run that was cut
+    off (complete false) has not looked at the rest of the event."""
+
+    def test_incomplete_negative_is_unchecked(self, tmp_path):
+        _event(tmp_path, "event_20260901_100000_a", False, 0.9, complete=False,
+               failed_batches=0, batches=[{"abnormal_event": False, "confidence": 0.9}])
+        e = event_server.scan_events(tmp_path)[0]
+        assert e["unchecked"] is True
+        assert "KARARSIZ" in event_server.badge(e)
+
+    def test_incomplete_positive_is_positive(self, tmp_path):
+        _event(tmp_path, "event_20260901_100000_a", True, 0.8, complete=False,
+               batches=[{"abnormal_event": True, "confidence": 0.8}])
+        e = event_server.scan_events(tmp_path)[0]
+        assert e["unchecked"] is False
+        assert "POZITIF" in event_server.badge(e)
+
+
 class TestPeakNote:
     def test_top_level_note_wins(self):
         assert event_server.peak_note({"batches": [

@@ -15,7 +15,12 @@ sonra zamana gore yapilir; ham confidence siralamasi ayri bir secenektir.
 final_abnormal_event=false yalnizca "ANALIZ EDILEN hicbir batch pozitif
 degil" demektir. Batch'lerden biri hic dogrulanamadiysa (failed_batches /
 backend_outage) olay negatif degil KARARSIZ gosterilir: bakilmayan parca
-nobetin kendisi olabilir.
+nobetin kendisi olabilir. Yarida kesilmis bir analiz (complete: false) de,
+pozitif degilse, KARARSIZ'dir.
+
+Pozitif bir olayda 0 confidence olcum degil, isarettir: kurtarilmis
+(salvaged) ya da null gelmis bir deger. Kartta "?" gorunur ve confidence
+siralamasinda en uste gider.
 """
 import argparse
 import html
@@ -114,6 +119,7 @@ def scan_events(root):
             video = clip if clip.exists() else None
         verdict = a.get("final_abnormal_event")
         failed = int(a.get("failed_batches") or 0)
+        conf = float(a.get("final_confidence") or 0.0)
         items.append({
             "id": d.name,
             "camera": cam,
@@ -123,10 +129,12 @@ def scan_events(root):
             # verdict True ise dogrulanamayan batch karari degistirmez;
             # degilse eksik bakilmis olay negatif sayilamaz
             "unchecked": verdict is not True and (
-                verdict is None or failed > 0 or bool(a.get("backend_outage"))),
+                verdict is None or failed > 0 or bool(a.get("backend_outage"))
+                or a.get("complete") is False),
             "failed_batches": failed,
             "total_batches": len(a.get("batches") or []),
-            "confidence": float(a.get("final_confidence") or 0.0),
+            # None: bilinmiyor (modul notu)
+            "confidence": None if verdict is True and not conf else conf,
             "reason": a.get("final_reason") or "",
             "signs": collect_signs(a),
             "note": peak_note(a),
@@ -164,7 +172,8 @@ def get_index(root, thumbs=None):
 
 def sort_items(items, mode):
     if mode == "conf":
-        return sorted(items, key=lambda e: (e["confidence"], e["when_ts"]), reverse=True)
+        return sorted(items, key=lambda e: (1.0 if e["confidence"] is None else e["confidence"],
+                                            e["when_ts"]), reverse=True)
     if mode == "time":
         return sorted(items, key=lambda e: e["when_ts"], reverse=True)
     # varsayilan: once pozitifler, sonra kararsizlar, sonra en yeni
@@ -227,6 +236,10 @@ def badge(e):
     return '<span class="b ' + cls + '">' + verdict_label(e) + '</span>'
 
 
+def conf_text(e, unknown="?"):
+    return unknown if e["confidence"] is None else "%.2f" % e["confidence"]
+
+
 def unchecked_text(e):
     """'2/7 dogrulanamadi' — yalnizca pozitif olmayan, eksik bakilmis olayda."""
     if not e["unchecked"] or not e["failed_batches"]:
@@ -242,7 +255,7 @@ def card_html(e):
         '<a class="card" href="/event/' + esc(e["id"]) + '">',
         '<div class="thumbwrap">',
         '<img loading="lazy" src="/thumb/' + esc(e["id"]) + '" alt="">',
-        '<span class="conf">%.2f</span>' % e["confidence"],
+        '<span class="conf">' + conf_text(e) + '</span>',
         '</div>',
         '<div class="meta">',
         '<div class="line1">' + badge(e) + '<span class="when">' + esc(when) + '</span></div>',
@@ -331,7 +344,7 @@ def detail_html(e):
             ("Kamera", e["camera"]),
             ("Karar", verdict_label(e)),
             ("Dogrulama", unchecked_text(e) or "-"),
-            ("Confidence", "%.2f" % e["confidence"]),
+            ("Confidence", conf_text(e, "bilinmiyor")),
             ("Gerekce", e["reason"]),
             ("Isaretler", ", ".join(e["signs"]) or "-"),
             ("Kare sayisi", str(e["frames"])),
