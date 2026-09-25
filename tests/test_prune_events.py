@@ -8,18 +8,23 @@ import prune_events
 DAY = 86400
 
 
-def _event(root, name, age_days, positive=None, analysis=None):
-    """analysis: the analysis.json text, or a dict to dump; written before
-    the mtime is set, since writing into the dir would reset it to now."""
+def _event(root, name, age_days, positive=None, analysis=None, meta=False, handled=None):
+    """analysis / handled: the analysis.json / handled.json text, or a value
+    to dump; meta writes event_meta.json. All written before the mtime is
+    set, since writing into the dir would reset it to now."""
     ev = root / name
     ev.mkdir(parents=True)
     (ev / "frame.jpg").write_bytes(b"x" * 1000)
     if positive is not None:
         analysis = {"final_abnormal_event": positive}
-    if analysis is not None:
-        (ev / "analysis.json").write_text(
-            analysis if isinstance(analysis, str) else json.dumps(analysis),
-            encoding="utf-8")
+    for fname, content in (("analysis.json", analysis), ("handled.json", handled)):
+        if content is not None:
+            (ev / fname).write_text(
+                content if isinstance(content, str) else json.dumps(content),
+                encoding="utf-8")
+    if meta:
+        (ev / "event_meta.json").write_text(
+            json.dumps({"t0": 0.0, "start": 1.0, "end": 9.0, "peaks": []}), encoding="utf-8")
     old = time.time() - age_days * DAY
     os.utime(ev, (old, old))
     return ev
@@ -84,6 +89,41 @@ class TestPrune:
         _event(tmp_path, "event_recent", 1, positive=False)
         removed, _ = prune_events.prune(tmp_path, keep_days=14)
         assert removed == ["event_old_neg"]
+
+    def test_captured_but_never_processed_event_is_kept(self, tmp_path):
+        # event_meta.json without handled.json: the monitor died before it
+        # verified or alerted, so nobody has seen this event.
+        _event(tmp_path, "event_old_unprocessed", 30, meta=True)
+        _event(tmp_path, "event_old_processed", 30, meta=True,
+               handled={"handled_at": 1.0, "alerted": False, "delivered": None})
+        _event(tmp_path, "event_recent", 1, positive=False)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_old_processed"]
+
+    def test_undelivered_alert_is_kept(self, tmp_path):
+        # The alert never reached the owner; the monitor keeps retrying it,
+        # and this dir is the only copy of what it would show.
+        _event(tmp_path, "event_old_undelivered", 30, meta=True,
+               handled={"handled_at": 1.0, "alerted": True, "delivered": False})
+        _event(tmp_path, "event_old_delivered", 30, meta=True,
+               handled={"handled_at": 1.0, "alerted": True, "delivered": True})
+        _event(tmp_path, "event_recent", 1, positive=False)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_old_delivered"]
+
+    def test_odd_handled_markers_never_stop_the_run(self, tmp_path):
+        # Unreadable or odd markers are kept, never guessed as done.
+        kept = {"event_old_truncated": "{not json", "event_old_null": "null",
+                "event_old_list": [True, False], "event_old_text": '"done"',
+                "event_old_no_delivered": {"alerted": True},
+                "event_old_odd_values": {"alerted": "yes", "delivered": "no"}}
+        for name, handled in kept.items():
+            _event(tmp_path, name, 30, handled=handled)
+        _event(tmp_path, "event_old_not_alerted", 30,
+               handled={"alerted": False, "delivered": False})
+        _event(tmp_path, "event_recent", 1, positive=False)
+        removed, _ = prune_events.prune(tmp_path, keep_days=14)
+        assert removed == ["event_old_not_alerted"]
 
     def test_dry_run_deletes_nothing(self, tmp_path):
         _event(tmp_path, "event_old_neg", 30, positive=False)

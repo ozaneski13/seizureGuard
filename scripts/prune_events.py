@@ -1,8 +1,10 @@
 """Disk hygiene for data/events: per camera, keep every event from the N
 most recent days that camera recorded anything; forever keep events the
 verifier flagged positive (they are the future training set), events it
-never fully checked, and one verified negative per camera per day as a hard
-negative; delete the other older negatives. Never touches anything else.
+never fully checked, events the monitor never finished (not processed, or
+their alert never delivered), and one verified negative per camera per day
+as a hard negative; delete the other older negatives. Never touches
+anything else.
 
 Usage: python scripts/prune_events.py [--root data/events] [--keep-days 14] [--dry-run]
 """
@@ -39,12 +41,32 @@ def is_unchecked(event_dir):
     these too, but a failed verification is not a negative, and an outage
     sends no per-event alert or clip, so this dir is the only copy. No
     analysis.json at all is not this case: with verify on, that event
-    already got its own "unverified" alert with the clip. Never raises."""
+    already got its own "unverified" alert with the clip (is_unfinished
+    keeps it when that alert was not delivered). Never raises."""
     try:
         a = json.loads((event_dir / "analysis.json").read_text(encoding="utf-8"))
         return bool(a.get("failed_batches") or a.get("backend_outage"))
     except Exception:
         return False         # missing: see above; unreadable: is_positive keeps it
+
+
+def is_unfinished(event_dir):
+    """The monitor never finished with this event: captured (event_meta.json)
+    but never processed (no handled.json; its restart sweep processes it),
+    or alerted but the alert was never delivered (it keeps retrying). Nobody
+    has seen it, so this dir is the only copy. A marker that does not read
+    as a finished event is kept, not guessed as done. Dirs from before these
+    files existed have neither and keep the other rules. Never raises."""
+    try:
+        handled = event_dir / "handled.json"
+        if not handled.exists():
+            return (event_dir / "event_meta.json").exists()
+        h = json.loads(handled.read_text(encoding="utf-8"))
+    except Exception:
+        return True
+    if not isinstance(h, dict):
+        return True
+    return bool(h.get("alerted")) and h.get("delivered") is not True
 
 
 def sample_score(event_dir):
@@ -137,8 +159,8 @@ def recent_events(events, keep_days, now):
 
 def prune(root, keep_days, dry_run=False, now=None):
     """Delete every event outside its camera's keep_days most recent active
-    days (recent_events) that is not a positive, an unchecked event or a
-    daily hard-negative sample."""
+    days (recent_events) that is not a positive, an unchecked or unfinished
+    event or a daily hard-negative sample."""
     now = time.time() if now is None else now
     events = [ev for ev in sorted(Path(root).glob("event_*")) if ev.is_dir()]
     if not events:
@@ -148,7 +170,7 @@ def prune(root, keep_days, dry_run=False, now=None):
     removed, freed = [], 0
     for ev in events:
         if (ev in recent or ev in samples or is_positive(ev)
-                or is_unchecked(ev)):
+                or is_unchecked(ev) or is_unfinished(ev)):
             continue
         freed += dir_size(ev)
         removed.append(ev.name)
