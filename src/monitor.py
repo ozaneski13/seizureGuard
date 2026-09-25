@@ -67,7 +67,7 @@ WATCHDOG_PING_SEC = 10.0         # systemd WatchdogSec must be well above this
 # watchdog restarts the monitor.
 HANDLE_DEADLINE_SEC = 5400
 EVENT_BACKLOG_ALERT = 10         # queued events before the owner is told
-SWEEP_MAX_AGE_SEC = 6 * 3600     # restart re-queues unhandled events this recent
+EVENT_BACKLOG_REMIND_SEC = 6 * 3600  # ...told again this often while it lasts
 
 
 class RingBuffer:
@@ -277,31 +277,51 @@ class EventWorker:
 
     Verification takes minutes; run inline, it stopped the read loop for
     all of them, so a seizure starting meanwhile was never seen and no alert
-    said the monitor was not watching. The queue never drops an event. Only
-    the main loop pings systemd, and it stops once stuck() says one event
-    has run past its deadline, so a wedged worker still gets restarted."""
+    said the monitor was not watching. The queue never drops an event, and
+    holds only its dir: the frames are on disk. An event whose alert was not
+    delivered is retried every retry_sec, between queued events, until it
+    is. Only the main loop pings systemd, and it stops once stuck() says one
+    event has run past its deadline, so a wedged worker still gets
+    restarted."""
 
     def __init__(self, process, deadline=HANDLE_DEADLINE_SEC,
-                 backlog_alert=EVENT_BACKLOG_ALERT):
-        self.process = process              # process(event_dir, fb)
+                 backlog_alert=EVENT_BACKLOG_ALERT,
+                 backlog_remind=EVENT_BACKLOG_REMIND_SEC,
+                 retry_sec=STREAM_BLIND_RETRY_SEC):
+        self.process = process              # process(event_dir) -> False while undelivered
         self.deadline = deadline
         self.backlog_alert = backlog_alert
+        self.backlog_remind = backlog_remind
+        self.retry_sec = retry_sec
         self.queue = queue.Queue()
         self.busy_since = None              # set by the worker, read by the main loop
-        self.backlog_alerted = False        # main thread only
+        self.retries = {}                   # event_dir -> due time; worker only
+        self.backlog_last = None            # (time, size) of the last backlog alert;
+        self._backlog_undo = None           # main thread only
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
-    def submit(self, event_dir, fb=None):
-        """Queues an event. Returns True when this one took the backlog past
-        backlog_alert, once per backlog episode (the caller alerts)."""
+    def submit(self, event_dir, now=None):
+        """Queues an event. Returns True when the caller should send a
+        backlog alert: the backlog first went past backlog_alert, has doubled
+        since the last alert, or has lasted backlog_remind since it."""
+        now = time.monotonic() if now is None else now
         if self.queue.empty():
-            self.backlog_alerted = False
-        self.queue.put((event_dir, fb))
-        if self.queue.qsize() > self.backlog_alert and not self.backlog_alerted:
-            self.backlog_alerted = True
+            self.backlog_last = None
+        self.queue.put(event_dir)
+        size = self.queue.qsize()
+        last = self.backlog_last
+        if size > self.backlog_alert and (
+                last is None or size >= 2 * last[1] or now - last[0] >= self.backlog_remind):
+            self._backlog_undo = last
+            self.backlog_last = (now, size)
             return True
         return False
+
+    def backlog_undelivered(self):
+        """The backlog alert never reached the owner: the next submit
+        while the backlog lasts tries again."""
+        self.backlog_last = self._backlog_undo
 
     def stuck(self, now):
         since = self.busy_since             # read once: the worker may clear it
@@ -314,24 +334,46 @@ class EventWorker:
 
     def _loop(self):
         while True:
-            item = self.queue.get()
-            if item is None:
-                self.queue.task_done()
-                return
-            event_dir, fb = item
-            self.busy_since = time.monotonic()
+            now = time.monotonic()
+            for event_dir in [d for d, due in self.retries.items() if due <= now]:
+                del self.retries[event_dir]
+                self._run(event_dir)
+            timeout = None
+            if self.retries:
+                timeout = max(0.0, min(self.retries.values()) - time.monotonic())
             try:
-                self.process(event_dir, fb)
-            except Exception as e:
-                # Recall first: an event that crashed its processing is an
-                # event nobody checked, so it still alerts.
-                print(f"[ERROR] processing {Path(event_dir).name} failed: {e!r}",
-                      flush=True)
-                deliver(f"UNVERIFIED motion event - processing failed ({e}) - "
-                        f"{Path(event_dir).name}")
+                event_dir = self.queue.get(timeout=timeout)
+            except queue.Empty:
+                continue
+            try:
+                if event_dir is None:
+                    return
+                self._run(event_dir)
             finally:
-                self.busy_since = None
                 self.queue.task_done()
+
+    def _run(self, event_dir):
+        self.busy_since = time.monotonic()
+        try:
+            delivered = self.process(event_dir) is not False
+        except Exception as e:
+            # Recall first: an event that crashed its processing is an
+            # event nobody checked, so it still alerts, and the alert is
+            # recorded like any other so it is retried, not re-verified.
+            name = Path(event_dir).name
+            print(f"[ERROR] processing {name} failed: {e!r}", flush=True)
+            text = f"UNVERIFIED motion event - processing failed ({e}) - {name}"
+            delivered = deliver(text)
+            try:
+                mark_handled(event_dir, alerted=True, delivered=delivered, text=text)
+            except Exception as e2:
+                print(f"[ERROR] could not record {name} as handled: {e2!r}", flush=True)
+        finally:
+            self.busy_since = None
+        if not delivered:
+            print(f"[WARN] alert for {Path(event_dir).name} not delivered; "
+                  f"retrying in {self.retry_sec:.0f}s", flush=True)
+            self.retries[event_dir] = time.monotonic() + self.retry_sec
 
 
 # ---------------------------------------------------------------- pipeline
@@ -436,12 +478,19 @@ def alert_text_for(verdict, event_name):
     if verdict.get("final_abnormal_event"):
         conf = float(verdict.get("final_confidence") or 0.0)
         pos = verdict.get("positive_batches")
-        total = len(verdict.get("batches") or [])
+        batches = verdict.get("batches") or []
+        total = len(batches)
         # How much of the event looked abnormal is the fastest triage signal:
         # a real seizure flagged 6/7 batches, false alarms flagged 1/7.
         span = f", {pos}/{total} segments" if pos and total else ""
-        return (f"Abnormal motor event detected (confidence {conf:.2f}{span})"
-                f" - {event_name}")
+        positives = [b for b in batches if b.get("abnormal_event") is True]
+        if positives and all(b.get("salvaged") for b in positives):
+            # A salvaged positive carries confidence 0.0 as a marker, not a
+            # measurement; printed, it reads like a false alarm.
+            confidence = "confidence unknown, the model reply was partly unreadable"
+        else:
+            confidence = f"confidence {conf:.2f}"
+        return f"Abnormal motor event detected ({confidence}{span}) - {event_name}"
     if verdict.get("backend_outage"):
         return None          # handled once by OutageNotifier, not per event
     failed = int(verdict.get("failed_batches") or 0)
@@ -523,9 +572,10 @@ def clip_window(verdict, frames, peaks, t0):
 
 
 def capture_event(ring, motion_history, start, end, out_root, name="monitor"):
-    """Main-thread half of an event: snapshot the ring and write the frames
-    plus EVENT_META, so the rest can run from disk alone. Kept cheap, as the
-    read loop waits for it. Returns (event_dir, fb) or None."""
+    """Main-thread half of an event: snapshot the ring and write the frames,
+    EVENT_META and the full-rate ring JPEGs, so the rest runs from disk
+    alone and nothing waits in memory. Kept cheap (no encoding), as the read
+    loop waits for it. Returns event_dir or None."""
     t0 = start - PRE_ROLL_SEC
     fb = ring.snapshot(t0, end)
     if len(fb) == 0:
@@ -542,9 +592,10 @@ def capture_event(ring, motion_history, start, end, out_root, name="monitor"):
         fb, list(motion_history), event_dir, t0, end)
     (event_dir / EVENT_META).write_text(json.dumps(
         {"t0": t0, "start": start, "end": end, "peaks": peaks}), encoding="utf-8")
+    alert_clip.spill_ring(fb, event_dir)
     print(f"✅ Event captured: {event_dir} "
           f"({base_saved} base + {burst_saved} burst, {end - start:.1f}s of motion)")
-    return event_dir, fb
+    return event_dir
 
 
 def read_event_meta(event_dir):
@@ -552,69 +603,137 @@ def read_event_meta(event_dir):
     existed: no peaks means the first frame as photo and no peak clip."""
     try:
         meta = json.loads((Path(event_dir) / EVENT_META).read_text(encoding="utf-8"))
-        return {"t0": float(meta["t0"]), "end": float(meta["end"]),
+        return {"t0": float(meta["t0"]),
                 "peaks": [float(p) for p in meta.get("peaks") or []]}
     except Exception:
-        return {"t0": 0.0, "end": None, "peaks": []}
+        return {"t0": 0.0, "peaks": []}
 
 
-def mark_handled(event_dir, alerted, delivered=None):
-    (Path(event_dir) / HANDLED_MARKER).write_text(json.dumps(
-        {"handled_at": time.time(), "alerted": alerted, "delivered": delivered}),
-        encoding="utf-8")
+def mark_handled(event_dir, alerted, delivered=None, text=None, photo=None, video=None):
+    """Writes HANDLED_MARKER. An alert is recorded with its text and media
+    (relative to the event dir), so an undelivered one can be resent as it
+    was, without verifying again."""
+    event_dir = Path(event_dir)
+    record = {"handled_at": time.time(), "alerted": alerted, "delivered": delivered}
+    if alerted:
+        record.update(
+            text=text,
+            photo=photo and Path(photo).relative_to(event_dir).as_posix(),
+            video=video and Path(video).relative_to(event_dir).as_posix())
+    tmp = event_dir / (HANDLED_MARKER + ".tmp")
+    tmp.write_text(json.dumps(record), encoding="utf-8")
+    os.replace(tmp, event_dir / HANDLED_MARKER)
 
 
-def process_event(event_dir, use_verify, outage_notifier, fb=None):
-    """Worker half of an event: event video (when the ring frames are at
-    hand), pose gate, verify, alert, then HANDLED_MARKER. Reads everything
-    else from disk, so a restart can finish an event the previous process
-    never did."""
+def read_handled(event_dir):
+    """HANDLED_MARKER's record, or None when there is none or it cannot be
+    read (then the event counts as unfinished)."""
+    try:
+        record = json.loads((Path(event_dir) / HANDLED_MARKER).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def undelivered(record):
+    return bool(record.get("alerted")) and not record.get("delivered")
+
+
+def finished_verdict(event_dir):
+    """analysis.json from an earlier run when it is a finished verdict: a
+    positive, or an analysis with no failed batch and no outage. None means
+    verify (again). A finished verdict is never asked for twice: the model
+    is nondeterministic, and a second answer could silence a positive the
+    first one found."""
+    try:
+        verdict = json.loads((Path(event_dir) / "analysis.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(verdict, dict):
+        return None
+    if verdict.get("final_abnormal_event") or not (
+            verdict.get("failed_batches") or verdict.get("backend_outage")):
+        return verdict
+    return None
+
+
+def redeliver(event_dir, handled):
+    """Resends a recorded, undelivered alert as it was. Returns delivered."""
+    photo = event_dir / handled["photo"] if handled.get("photo") else None
+    video = event_dir / handled["video"] if handled.get("video") else None
+    if not deliver(handled["text"], photo_path=photo, video_path=video):
+        return False
+    mark_handled(event_dir, True, True, handled["text"], photo, video)
+    return True
+
+
+def process_event(event_dir, use_verify, outage_notifier):
+    """Worker half of an event: event video, pose gate, verify, alert, then
+    HANDLED_MARKER. Reads everything from disk, so a restart can finish an
+    event the previous process never did: an undelivered alert is only
+    resent, and a finished verdict is reused. Returns False while its alert
+    is undelivered."""
+    handled = read_handled(event_dir)
+    if handled is not None:
+        if not undelivered(handled):
+            return True
+        if handled.get("text"):
+            return redeliver(event_dir, handled)
+        # a marker from before the text was recorded: build the alert again
+
     meta = read_event_meta(event_dir)
     t0, peaks = meta["t0"], meta["peaks"]
-    if fb is not None:
-        alert_clip.save_event_video(fb, event_dir, t0, meta["end"])
+    alert_clip.save_event_video(event_dir, t0)
 
-    decision = run_pose_gate(event_dir)
-    if decision == "skip":
-        print("[INFO] pose gate: no seizure-like oscillation; not alerting")
-        mark_handled(event_dir, alerted=False)
-        return
+    verdict = finished_verdict(event_dir)
+    if verdict is not None:
+        print(f"[INFO] {event_dir.name}: reusing its finished verdict", flush=True)
+    else:
+        decision = run_pose_gate(event_dir)
+        if decision == "skip":
+            print("[INFO] pose gate: no seizure-like oscillation; not alerting")
+            mark_handled(event_dir, alerted=False)
+            return True
 
-    verdict = run_verify(event_dir) if use_verify else None
-    outage = (verdict or {}).get("backend_outage")
-    if outage:
-        notify, skipped = outage_notifier.should_notify(time.time())
-        if notify:
-            extra = f" ({skipped} further events since the last notice)" if skipped else ""
-            if not deliver(
-                    f"seizureGuard: AI verification unavailable{extra} - motion is "
-                    f"still being recorded but NOT checked. Reason: {outage}"):
+        verdict = run_verify(event_dir) if use_verify else None
+        outage = (verdict or {}).get("backend_outage")
+        if outage:
+            notify, skipped = outage_notifier.should_notify(time.time())
+            if notify:
+                extra = f" ({skipped} further events since the last notice)" if skipped else ""
+                if not deliver(
+                        f"seizureGuard: AI verification unavailable{extra} - motion is "
+                        f"still being recorded but NOT checked. Reason: {outage}"):
+                    outage_notifier.undelivered()
+            else:
+                print(f"[WARN] verification unavailable ({outage}); "
+                      f"{skipped} events unchecked", flush=True)
+        # No analysis at all (verify timed out or crashed) is no sign of health.
+        elif verdict is not None and outage_notifier.recovered():
+            if not deliver("seizureGuard: AI verification is back online."):
                 outage_notifier.undelivered()
-        else:
-            print(f"[WARN] verification unavailable ({outage}); "
-                  f"{skipped} events unchecked", flush=True)
-    elif outage_notifier.recovered():
-        if not deliver("seizureGuard: AI verification is back online."):
-            outage_notifier.undelivered()
 
     text = alert_text_for(verdict, event_dir.name)
     if text is None:
         print("[INFO] verify: no alert for this event")
         mark_handled(event_dir, alerted=False)
-        return
+        return True
 
     # make_clip returns None when encoding fails; the photo still goes out.
     window = clip_window(verdict, alert_clip.event_frames(event_dir), peaks, t0)
     clip = alert_clip.make_clip(event_dir, window)
-    delivered = deliver(text, photo_path=peak_frame_path(event_dir, peaks, t0),
-                        video_path=clip)
-    mark_handled(event_dir, alerted=True, delivered=delivered)
+    photo = peak_frame_path(event_dir, peaks, t0)
+    delivered = deliver(text, photo_path=photo, video_path=clip)
+    mark_handled(event_dir, alerted=True, delivered=delivered, text=text,
+                 photo=photo, video=clip)
+    return delivered
 
 
-def unhandled_events(out_root, name, now, max_age=SWEEP_MAX_AGE_SEC):
-    """This monitor's events (both monitors share out_root) that a restart
-    left without HANDLED_MARKER, oldest first. Older ones are left alone:
-    events from before the marker existed never got one."""
+def unhandled_events(out_root, name):
+    """This monitor's unfinished events (both monitors share out_root),
+    oldest first: no HANDLED_MARKER, or one recording an undelivered alert.
+    Only dirs with EVENT_META count, whatever their age; the code from
+    before it finished its events inline, so their dirs are never swept."""
     pattern = re.compile(rf"^event_(\d{{8}}_\d{{6}})(?:_(\d+))?_{re.escape(name)}$")
     found = []
     try:
@@ -624,10 +743,12 @@ def unhandled_events(out_root, name, now, max_age=SWEEP_MAX_AGE_SEC):
     for d in dirs:
         m = pattern.match(d.name)
         try:
-            if (m is None or not d.is_dir() or (d / HANDLED_MARKER).exists()
-                    or now - d.stat().st_mtime > max_age):
+            if m is None or not d.is_dir() or not (d / EVENT_META).exists():
                 continue
         except OSError:
+            continue
+        handled = read_handled(d)
+        if handled is not None and not undelivered(handled):
             continue
         found.append(((m.group(1), int(m.group(2) or 0)), d))
     return [d for _, d in sorted(found)]
@@ -708,7 +829,7 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
     moving_flag = MovingFlag(os.environ.get("SEIZUREGUARD_MOVING_FLAG"))
     outage_notifier = OutageNotifier()     # used by the worker thread only
     worker = EventWorker(
-        lambda event_dir, fb: process_event(event_dir, use_verify, outage_notifier, fb))
+        lambda event_dir: process_event(event_dir, use_verify, outage_notifier))
     events = []
     prev_gray = None
     frame_idx = 0
@@ -728,31 +849,31 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
                   f"{HANDLE_DEADLINE_SEC}s; the worker is wedged. No longer "
                   "pinging systemd, so its watchdog restarts the monitor.", flush=True)
 
-    def enqueue(event_dir, fb=None):
-        if worker.submit(event_dir, fb):
+    def enqueue(event_dir):
+        if worker.submit(event_dir, time.monotonic()):
             waiting = worker.queue.qsize()
             print(f"[WARN] {waiting} events waiting for verification", flush=True)
-            alerts.send_alert(
-                f"seizureGuard: {waiting} motion events are waiting for "
-                "verification - their alerts are delayed. The camera is still "
-                "being watched.")
+            if not deliver(
+                    f"seizureGuard: {waiting} motion events are waiting for "
+                    "verification - their alerts are delayed. The camera is still "
+                    "being watched."):
+                worker.backlog_undelivered()
 
     def capture(ev):
-        captured = capture_event(ring, motion_history, ev[0], ev[1], out_root, name)
-        if captured is None:
+        event_dir = capture_event(ring, motion_history, ev[0], ev[1], out_root, name)
+        if event_dir is None:
             return
-        events.append(captured[0])
-        enqueue(*captured)
+        events.append(event_dir)
+        enqueue(event_dir)
 
-    if use_verify and not file_mode:
-        # A restart mid-verify (deploy, token setup, watchdog kill) must not
-        # drop the event it interrupted. Swept before the stream is opened:
-        # the camera may stay down for longer than SWEEP_MAX_AGE_SEC.
-        requeued = unhandled_events(out_root, name, time.time())
-        if requeued:
-            print(f"[INFO] re-queued {len(requeued)} unfinished events: "
-                  f"{', '.join(d.name for d in requeued)}", flush=True)
-        for event_dir in requeued:
+    if not file_mode:
+        # A restart (deploy, token setup, watchdog kill, power cut) must not
+        # drop the event it interrupted or an alert that never arrived,
+        # whatever their age and whether verify is on. Swept before the
+        # stream is opened: the camera may stay down for hours.
+        for event_dir in unhandled_events(out_root, name):
+            state = "alert not delivered" if read_handled(event_dir) else "not finished"
+            print(f"[INFO] re-queued {event_dir.name} ({state})", flush=True)
             enqueue(event_dir)
 
     if file_mode:
@@ -767,6 +888,12 @@ def run(source, out_root=OUT_ROOT, log_motion=False, name="monitor"):
             if file_mode:
                 break
             now = time.time()
+            if watchdog.stalled_since is None:
+                # First failed read of a stall: capture the motion in flight
+                # now, before the frames after the stall evict it from the ring.
+                ev = trigger.flush()
+                if ev is not None:
+                    capture(ev)
             for action in watchdog.failed(now):
                 if action == "reconnect":
                     print(f"[WARN] stream stalled; reconnecting to {source}", flush=True)

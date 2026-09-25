@@ -332,8 +332,10 @@ class TestIntegration:
         assert (first / "base").is_dir()
         assert (first / "burst").is_dir()
         assert list((first / "burst").glob("frame_*.jpg"))
-        # the full-rate video alert clips are cut from, written by the worker
+        # the full-rate video alert clips are cut from, built by the worker
+        # from the ring frames spilled at capture, which it then removes
         assert (first / "event.mp4").exists()
+        assert not (first / monitor.alert_clip.RING_DIR).exists()
 
 
 class TestAlertTextFor:
@@ -372,6 +374,31 @@ class TestAlertTextFor:
 
     def test_no_verdict_is_unverified(self):
         assert "unverified" in monitor.alert_text_for(None, "ev")
+
+    def _salvaged(self, *batches):
+        return {"final_abnormal_event": True, "final_confidence": 0.0,
+                "positive_batches": sum(b.get("abnormal_event") is True for b in batches),
+                "failed_batches": 0, "batches": list(batches)}
+
+    def test_salvaged_positive_does_not_claim_zero_confidence(self):
+        """Regression: a positive recovered from an unreadable model reply
+        carries confidence 0.0 as a marker, and the alert read 'confidence
+        0.00', which the owner takes for a false alarm."""
+        text = monitor.alert_text_for(self._salvaged(
+            {"abnormal_event": True, "confidence": 0.0, "salvaged": True},
+            {"abnormal_event": False, "confidence": 0.9},
+            {"abnormal_event": False, "confidence": 0.9}), "ev")
+        assert text.startswith("Abnormal motor event detected")
+        assert "0.00" not in text and "confidence unknown" in text
+        assert "1/3 segments" in text and text.endswith(" - ev")
+
+    def test_one_readable_positive_keeps_its_confidence(self):
+        verdict = self._salvaged(
+            {"abnormal_event": True, "confidence": 0.0, "salvaged": True},
+            {"abnormal_event": True, "confidence": 0.7})
+        verdict["final_confidence"] = 0.7
+        text = monitor.alert_text_for(verdict, "ev")
+        assert "confidence 0.70, 2/2 segments" in text
 
 
 class TestVerifyProbe:
@@ -582,21 +609,44 @@ class TestProcessEvent:
     @pytest.fixture
     def env(self, monkeypatch):
         monkeypatch.delenv("SEIZUREGUARD_POSE_PYTHON", raising=False)
-        state = types.SimpleNamespace(sent=[], windows=[], verdict=None, delivered=True)
+        state = types.SimpleNamespace(sent=[], media=[], windows=[], verdict=None,
+                                      delivered=True, verified=[], gated=[])
 
         def fake_send(text, photo_path=None, video_path=None):
             state.sent.append(text)
+            state.media.append((photo_path, video_path))
             return state.delivered
+
+        def fake_verify(event_dir):
+            state.verified.append(event_dir)
+            return state.verdict
+
+        def fake_gate(event_dir):
+            state.gated.append(event_dir)
+            return "escalate"
+
+        def fake_clip(event_dir, window):
+            state.windows.append(window)
+            clip = event_dir / "alert_clip.mp4"
+            clip.write_bytes(b"mp4")
+            return clip
 
         monkeypatch.setattr(monitor.alerts, "send_alert", fake_send)
         monkeypatch.setattr(monitor.alerts, "telegram_configured", lambda: True)
-        monkeypatch.setattr(monitor, "run_verify", lambda d: state.verdict)
-        monkeypatch.setattr(monitor.alert_clip, "make_clip",
-                            lambda d, w: state.windows.append(w))
+        monkeypatch.setattr(monitor, "run_verify", fake_verify)
+        monkeypatch.setattr(monitor, "run_pose_gate", fake_gate)
+        monkeypatch.setattr(monitor.alert_clip, "make_clip", fake_clip)
         return state
 
     def _handled(self, event_dir):
         return json.loads((event_dir / monitor.HANDLED_MARKER).read_text())
+
+    POSITIVE = {"final_abnormal_event": True, "final_confidence": 0.8,
+                "positive_batches": 1, "failed_batches": 0,
+                "batches": [{"abnormal_event": True, "confidence": 0.8}]}
+    NEGATIVE = {"final_abnormal_event": False, "final_confidence": 0.9,
+                "positive_batches": 0, "failed_batches": 0,
+                "batches": [{"abnormal_event": False, "confidence": 0.9}]}
 
     def test_failed_batch_alert_comes_with_a_clip(self, env, tmp_path):
         env.verdict = {"final_abnormal_event": False, "failed_batches": 1,
@@ -615,12 +665,105 @@ class TestProcessEvent:
         assert env.sent == []
         assert self._handled(ev)["alerted"] is False
 
-    def test_undelivered_alert_is_recorded(self, env, tmp_path):
+    def test_undelivered_alert_is_recorded_for_resending(self, env, tmp_path):
         env.delivered = False
         ev = _make_event(tmp_path)
-        monitor.process_event(ev, False, monitor.OutageNotifier())
+        assert monitor.process_event(ev, False, monitor.OutageNotifier()) is False
         handled = self._handled(ev)
         assert handled["alerted"] is True and handled["delivered"] is False
+        assert handled["text"] == env.sent[0]
+        assert handled["photo"] == "base/frame_040_t_20.000s.jpg"   # the motion peak
+        assert handled["video"] == "alert_clip.mp4"
+
+    def test_undelivered_alert_is_resent_as_it_was_without_verifying_again(self, env, tmp_path):
+        """Regression: an alert Telegram did not take was recorded as lost
+        and never sent again, a verified seizure included."""
+        env.verdict = self.POSITIVE
+        env.delivered = False
+        ev = _make_event(tmp_path)
+        notifier = monitor.OutageNotifier()
+        assert monitor.process_event(ev, True, notifier) is False
+        env.verdict = self.NEGATIVE             # a second verify would silence it
+        env.delivered = True
+        assert monitor.process_event(ev, True, notifier) is True
+        assert env.verified == [ev] and env.gated == [ev]
+        assert env.sent == [f"Abnormal motor event detected (confidence 0.80, "
+                            f"1/1 segments) - {ev.name}"] * 2
+        assert env.media[1] == env.media[0] == (
+            ev / "base" / "frame_040_t_20.000s.jpg", ev / "alert_clip.mp4")
+        assert self._handled(ev)["delivered"] is True
+        assert monitor.process_event(ev, True, notifier) is True
+        assert len(env.sent) == 2               # delivered is done
+
+    def test_marker_without_alert_text_builds_the_alert_again(self, env, tmp_path):
+        ev = _make_event(tmp_path)
+        (ev / monitor.HANDLED_MARKER).write_text(json.dumps(
+            {"handled_at": 1.0, "alerted": True, "delivered": False}))
+        assert monitor.process_event(ev, False, monitor.OutageNotifier()) is True
+        assert env.sent == [f"Motion event captured (unverified) - {ev.name}"]
+
+    @pytest.mark.parametrize("analysis", [
+        POSITIVE,
+        dict(POSITIVE, failed_batches=3, backend_outage="You've hit your limit"),
+    ])
+    def test_finished_positive_verdict_is_reused(self, env, tmp_path, analysis):
+        """Regression: a restart between verify and the alert re-verified the
+        event from scratch; a nondeterministic second answer silenced a
+        positive the first run had found."""
+        ev = _make_event(tmp_path)
+        (ev / "analysis.json").write_text(json.dumps(analysis))
+        env.verdict = self.NEGATIVE
+        assert monitor.process_event(ev, True, monitor.OutageNotifier()) is True
+        assert env.verified == [] and env.gated == []
+        assert env.sent[0].startswith("Abnormal motor event detected (confidence 0.80")
+        assert self._handled(ev)["delivered"] is True
+
+    def test_finished_negative_verdict_is_reused(self, env, tmp_path):
+        ev = _make_event(tmp_path)
+        (ev / "analysis.json").write_text(json.dumps(self.NEGATIVE))
+        env.verdict = self.POSITIVE
+        monitor.process_event(ev, True, monitor.OutageNotifier())
+        assert env.verified == [] and env.sent == []
+        assert self._handled(ev)["alerted"] is False
+
+    @pytest.mark.parametrize("analysis", [
+        json.dumps(dict(NEGATIVE, failed_batches=1)),
+        json.dumps(dict(NEGATIVE, backend_outage="529 overloaded")),
+        '{"final_abnormal_event": tr',
+    ])
+    def test_unfinished_verdict_is_verified_again(self, env, tmp_path, analysis):
+        ev = _make_event(tmp_path)
+        (ev / "analysis.json").write_text(analysis)
+        env.verdict = self.POSITIVE
+        monitor.process_event(ev, True, monitor.OutageNotifier())
+        assert env.verified == [ev]
+        assert env.sent[0].startswith("Abnormal motor event detected")
+
+    def test_no_analysis_is_not_a_recovery(self, env, tmp_path):
+        """Regression: verify timing out (no analysis.json) during an outage
+        sent 'back online' while nothing was being checked."""
+        notifier = monitor.OutageNotifier()
+        notifier.should_notify(1000.0)
+        env.verdict = None
+        monitor.process_event(_make_event(tmp_path, "event_a"), True, notifier)
+        assert env.sent == ["Motion event captured (unverified) - event_a"]
+        env.verdict = self.NEGATIVE
+        monitor.process_event(_make_event(tmp_path, "event_b"), True, notifier)
+        assert env.sent[-1] == "seizureGuard: AI verification is back online."
+
+    def test_event_video_is_built_from_the_spilled_ring_frames(self, env, tmp_path):
+        """Regression: event.mp4 came from frames held in memory by the
+        queue, so an event still queued at a restart never got its video."""
+        ev = _make_event(tmp_path)
+        fb = monitor.FrameBuffer()
+        for i in range(60):
+            fb.append(1000.0 + i / 15, monitor.encode_jpg(_motion_frame(i)))
+        monitor.alert_clip.spill_ring(fb, ev)
+        monitor.process_event(ev, False, monitor.OutageNotifier())
+        assert (ev / "event.mp4").stat().st_size > 0
+        times = json.loads((ev / "event_times.json").read_text())["times"]
+        assert len(times) == 60 and times[0] == 0.0
+        assert not (ev / monitor.alert_clip.RING_DIR).exists()
 
     def test_event_without_meta_file_still_alerts(self, env, tmp_path):
         ev = _make_event(tmp_path, meta=False)
@@ -675,18 +818,18 @@ class TestProcessEvent:
 
         def verify(event_dir):
             assert not (event_dir / monitor.HANDLED_MARKER).exists()
-            assert monitor.unhandled_events(tmp_path, "mi360", time.time()) == [ev]
+            assert monitor.unhandled_events(tmp_path, "mi360") == [ev]
             raise Restart
 
         monkeypatch.setattr(monitor, "run_verify", verify)
         with pytest.raises(Restart):
             monitor.process_event(ev, True, monitor.OutageNotifier())
-        assert monitor.unhandled_events(tmp_path, "mi360", time.time()) == [ev]
+        assert monitor.unhandled_events(tmp_path, "mi360") == [ev]
 
 
 class TestEventWorker:
     def test_stuck_only_past_the_deadline(self):
-        w = monitor.EventWorker(lambda d, fb: None, deadline=100.0)
+        w = monitor.EventWorker(lambda d: None, deadline=100.0)
         try:
             assert w.stuck(5000.0) is False          # idle is never stuck
             w.busy_since = 1000.0
@@ -702,7 +845,7 @@ class TestEventWorker:
     def test_busy_only_while_processing(self):
         release, seen = threading.Event(), []
 
-        def process(event_dir, fb):
+        def process(event_dir):
             seen.append(w.busy_since)
             release.wait(5)
 
@@ -719,7 +862,7 @@ class TestEventWorker:
 
     def test_backlog_alert_once_per_episode(self):
         gate = [threading.Event()]
-        w = monitor.EventWorker(lambda d, fb: gate[0].wait(5), backlog_alert=10)
+        w = monitor.EventWorker(lambda d: gate[0].wait(5), backlog_alert=10)
         assert sum(w.submit(f"a{i}") for i in range(15)) == 1
         gate[0].set()
         w.queue.join()
@@ -728,21 +871,134 @@ class TestEventWorker:
         gate[0].set()
         w.close()
 
-    def test_crashing_event_still_alerts_and_the_worker_goes_on(self, monkeypatch):
+    def _blocked(self, **kwargs):
+        """A worker stuck on its first event, so qsize counts every later
+        submit exactly."""
+        gate = threading.Event()
+        w = monitor.EventWorker(lambda d: gate.wait(10), backlog_alert=10,
+                                backlog_remind=3600.0, **kwargs)
+        w.submit("first", now=0.0)
+        for _ in range(500):
+            if w.busy_since is not None:
+                break
+            time.sleep(0.01)
+        return w, gate
+
+    def test_backlog_alert_repeats_when_the_backlog_doubles(self):
+        """Regression: the backlog alert fired once and stayed silent while
+        the backlog kept growing for hours."""
+        w, gate = self._blocked()
+        try:
+            fired = [k for k in range(1, 46) if w.submit(f"e{k}", now=float(k))]
+        finally:
+            gate.set()
+            w.close()
+        assert fired == [11, 22, 44]
+
+    def test_backlog_alert_repeats_while_the_backlog_lasts(self):
+        w, gate = self._blocked()
+        try:
+            fired = [k for k in range(1, 13) if w.submit(f"e{k}", now=float(k))]
+            fired += [k for k in (3611, 3612) if w.submit(f"e{k}", now=float(k))]
+        finally:
+            gate.set()
+            w.close()
+        assert fired == [11, 3611]
+
+    def test_undelivered_backlog_alert_is_retried(self):
+        w, gate = self._blocked()
+        try:
+            fired = [k for k in range(1, 12) if w.submit(f"e{k}", now=float(k))]
+            w.backlog_undelivered()
+            fired += [k for k in (12, 13) if w.submit(f"e{k}", now=float(k))]
+        finally:
+            gate.set()
+            w.close()
+        assert fired == [11, 12]
+
+    def test_the_queue_holds_only_event_dirs(self):
+        gate = threading.Event()
+        w = monitor.EventWorker(lambda d: gate.wait(10))
+        w.submit("a")
+        w.submit(Path("b"))
+        assert list(w.queue.queue)[-1] == Path("b")
+        gate.set()
+        w.close()
+
+    def _wait(self, cond):
+        for _ in range(500):
+            if cond():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_undelivered_alert_is_retried_until_delivered(self):
+        """Regression: an event alert that did not get through was never
+        sent again. Its retries must not hold back live events."""
+        order = []
+
+        def process(event_dir):
+            order.append(event_dir)
+            return event_dir != "lost" or order.count("lost") >= 3
+
+        w = monitor.EventWorker(process, retry_sec=0.05)
+        w.submit("lost")
+        w.submit("live")
+        assert self._wait(lambda: order.count("lost") >= 3)
+        time.sleep(0.2)                         # delivered: no more retries
+        w.close()
+        assert order[:2] == ["lost", "live"]
+        assert order.count("lost") == 3
+
+    def test_crashing_event_still_alerts_and_the_worker_goes_on(self, monkeypatch, tmp_path):
         sent, done = [], []
         monkeypatch.setattr(monitor.alerts, "send_alert", lambda text, **kw: sent.append(text))
+        monkeypatch.setattr(monitor.alerts, "telegram_configured", lambda: False)
+        bad = _make_event(tmp_path, "event_20260925_010000_mi360", n_frames=1)
+        good = _make_event(tmp_path, "event_20260925_010100_mi360", n_frames=1)
 
-        def process(event_dir, fb):
-            if event_dir.name == "event_bad":
+        def process(event_dir):
+            if event_dir == bad:
                 raise OSError("disk full")
             done.append(event_dir)
 
         w = monitor.EventWorker(process)
-        w.submit(Path("event_bad"))
-        w.submit(Path("event_good"))
+        w.submit(bad)
+        w.submit(good)
         w.close()
-        assert done == [Path("event_good")]
-        assert any(m.startswith("UNVERIFIED") and "event_bad" in m for m in sent)
+        assert done == [good]
+        assert any(m.startswith("UNVERIFIED") and bad.name in m for m in sent)
+        # recorded like any alert: a restart does not re-verify it
+        handled = monitor.read_handled(bad)
+        assert handled["alerted"] is True and handled["delivered"] is True
+        assert handled["text"].startswith("UNVERIFIED motion event - processing failed")
+        assert monitor.unhandled_events(tmp_path, "mi360") == [good]
+
+    def test_undelivered_crash_alert_is_resent_not_reprocessed(self, monkeypatch, tmp_path):
+        ev = _make_event(tmp_path, n_frames=1)
+        sent, verified = [], []
+
+        def fake_send(text, photo_path=None, video_path=None):
+            sent.append(text)
+            return len(sent) > 1                # the first one is lost
+
+        def verify(event_dir):
+            verified.append(event_dir)
+            raise OSError("disk full")
+
+        monkeypatch.delenv("SEIZUREGUARD_POSE_PYTHON", raising=False)
+        monkeypatch.setattr(monitor.alerts, "send_alert", fake_send)
+        monkeypatch.setattr(monitor.alerts, "telegram_configured", lambda: True)
+        monkeypatch.setattr(monitor, "run_verify", verify)
+        notifier = monitor.OutageNotifier()
+        w = monitor.EventWorker(lambda d: monitor.process_event(d, True, notifier),
+                                retry_sec=0.05)
+        w.submit(ev)
+        assert self._wait(lambda: (monitor.read_handled(ev) or {}).get("delivered"))
+        w.close()
+        assert verified == [ev]
+        assert len(sent) == 2 and sent[0] == sent[1]
+        assert sent[0].startswith("UNVERIFIED motion event - processing failed (disk full)")
 
 
 class _Stop(Exception):
@@ -750,42 +1006,80 @@ class _Stop(Exception):
 
 
 class TestRestartSweep:
-    def test_finds_only_this_monitors_recent_unhandled_events(self, tmp_path):
+    def test_finds_only_this_monitors_unfinished_events(self, tmp_path):
         now = time.time()
+
+        def handled(name, record):
+            d = _make_event(tmp_path, name, n_frames=1)
+            (d / monitor.HANDLED_MARKER).write_text(record)
+            return d
+
+        old = _make_event(tmp_path, "event_20260922_010000_mi360", n_frames=1)
+        os.utime(old, (now - 3 * 86400, now - 3 * 86400))
         own = _make_event(tmp_path, "event_20260925_010000_mi360", n_frames=1)
         again = _make_event(tmp_path, "event_20260925_010000_1_mi360", n_frames=1)
-        handled = _make_event(tmp_path, "event_20260925_010100_mi360", n_frames=1)
-        (handled / monitor.HANDLED_MARKER).write_text("{}")
+        handled("event_20260925_010100_mi360", '{"alerted": true, "delivered": true}')
+        handled("event_20260925_010110_mi360", '{"alerted": false, "delivered": null}')
+        handled("event_20260925_010120_mi360", "{}")
+        lost = handled("event_20260925_010130_mi360",
+                       '{"alerted": true, "delivered": false, "text": "x"}')
+        torn = handled("event_20260925_010140_mi360", '{"alerted": tr')
+        legacy = _make_event(tmp_path, "event_20260925_010150_mi360", n_frames=1, meta=False)
+        (legacy / "analysis.json").write_text(json.dumps({"final_abnormal_event": True}))
         _make_event(tmp_path, "event_20260925_010200_c700", n_frames=1)
         _make_event(tmp_path, "event_20260925_010300_bigmi360", n_frames=1)
-        old = _make_event(tmp_path, "event_20260924_010000_mi360", n_frames=1)
-        os.utime(old, (now - 7 * 3600, now - 7 * 3600))
         (tmp_path / "event_20260925_010400_mi360").write_text("not a dir")
-        assert monitor.unhandled_events(tmp_path, "mi360", now) == [own, again]
+        assert monitor.unhandled_events(tmp_path, "mi360") == [old, own, again, lost, torn]
+
+    def test_legacy_events_are_never_swept(self, tmp_path):
+        """Regression: the first start after the worker deploy re-verified and
+        re-alerted every event of the last 6 h, which the old code had
+        finished inline (it never wrote a marker, nor event_meta.json)."""
+        legacy = _make_event(tmp_path, "event_20260925_031500_mi360", n_frames=1, meta=False)
+        (legacy / "analysis.json").write_text(json.dumps({"final_abnormal_event": True}))
+        assert monitor.unhandled_events(tmp_path, "mi360") == []
+
+    def test_an_unfinished_event_is_swept_whatever_its_age(self, tmp_path):
+        """Regression: an event left unhandled for over 6 h (the Pi off for
+        the night, a long backlog) was dropped without a word."""
+        now = time.time()
+        ev = _make_event(tmp_path, "event_20260925_010000_mi360", n_frames=1)
+        os.utime(ev, (now - 7 * 3600, now - 7 * 3600))
+        assert monitor.unhandled_events(tmp_path, "mi360") == [ev]
 
     def test_missing_root_is_empty(self, tmp_path):
-        assert monitor.unhandled_events(tmp_path / "nope", "mi360", time.time()) == []
+        assert monitor.unhandled_events(tmp_path / "nope", "mi360") == []
 
-    def test_a_freshly_captured_event_is_found_by_the_sweep(self, tmp_path):
+    def test_a_captured_event_is_swept_and_still_gets_its_video(self, tmp_path, monkeypatch):
+        """The ring frames are spilled at capture, so an event a restart
+        caught still in the queue gets its full-rate video."""
         ring = RingBuffer()
-        jpg = monitor.encode_jpg(QUIET_FRAME)
         for i in range(300):
-            ring.append(1000.0 + i / 15, jpg)
+            ring.append(1000.0 + i / 15, monitor.encode_jpg(_motion_frame(i)))
         history = [(1000.0 + i / 15, 3.0) for i in range(300)]
-        event_dir, _ = monitor.capture_event(ring, history, 1008.0, 1015.0,
-                                             tmp_path, "mi360")
-        assert monitor.unhandled_events(tmp_path, "mi360", time.time()) == [event_dir]
+        event_dir = monitor.capture_event(ring, history, 1008.0, 1015.0, tmp_path, "mi360")
+        assert monitor.unhandled_events(tmp_path, "mi360") == [event_dir]
+        spilled = list((event_dir / monitor.alert_clip.RING_DIR).glob("*.jpg"))
+        assert len(spilled) == len(ring.snapshot(1003.0, 1015.0))
+
+        monkeypatch.delenv("SEIZUREGUARD_POSE_PYTHON", raising=False)
+        monkeypatch.setattr(monitor.alerts, "send_alert", lambda text, **kw: True)
+        monkeypatch.setattr(monitor.alerts, "telegram_configured", lambda: True)
+        monitor.process_event(event_dir, False, monitor.OutageNotifier())
+        times = json.loads((event_dir / "event_times.json").read_text())["times"]
+        assert len(times) == len(spilled) and times[0] == 0.0
+        assert (event_dir / "event.mp4").stat().st_size > 0
 
     def _run_live(self, monkeypatch, root, verify):
         processed, done = [], threading.Event()
 
-        def fake_process(event_dir, use_verify, outage_notifier, fb=None):
-            processed.append((event_dir, fb))
+        def fake_process(event_dir, use_verify, outage_notifier):
+            processed.append(event_dir)
             done.set()
 
         class Cap:
             def read(self):
-                done.wait(5 if verify else 0.3)
+                done.wait(5)
                 raise _Stop
 
             def release(self):
@@ -806,12 +1100,54 @@ class TestRestartSweep:
         root = tmp_path / "events"
         own = _make_event(root, "event_20260925_010000_mi360", n_frames=1)
         _make_event(root, "event_20260925_010000_c700", n_frames=1)
-        assert self._run_live(monkeypatch, root, verify=True) == [(own, None)]
+        assert self._run_live(monkeypatch, root, verify=True) == [own]
 
-    def test_no_sweep_with_verify_off(self, tmp_path, monkeypatch):
+    def test_sweep_with_verify_off(self, tmp_path, monkeypatch):
+        """Regression: with verify off (a failed `claude auth status` probe at
+        the restart) the interrupted event got no alert at all; unverified
+        is its right alert."""
         root = tmp_path / "events"
-        _make_event(root, "event_20260925_010000_mi360", n_frames=1)
-        assert self._run_live(monkeypatch, root, verify=False) == []
+        own = _make_event(root, "event_20260925_010000_mi360", n_frames=1)
+        assert self._run_live(monkeypatch, root, verify=False) == [own]
+
+    def test_restart_resends_an_undelivered_alert_without_verifying(self, tmp_path, monkeypatch):
+        root = tmp_path / "events"
+        ev = _make_event(root, "event_20260925_010000_mi360", n_frames=4)
+        (ev / "analysis.json").write_text(json.dumps(TestProcessEvent.POSITIVE))
+        text = f"Abnormal motor event detected (confidence 0.80, 1/1 segments) - {ev.name}"
+        (ev / monitor.HANDLED_MARKER).write_text(json.dumps(
+            {"handled_at": 1.0, "alerted": True, "delivered": False, "text": text,
+             "photo": "base/frame_001_t_0.500s.jpg", "video": None}))
+        sent, checked = [], []
+
+        def fake_send(text, photo_path=None, video_path=None):
+            sent.append((text, photo_path, video_path))
+            return True
+
+        class Cap:
+            def read(self):
+                for _ in range(500):
+                    if (monitor.read_handled(ev) or {}).get("delivered"):
+                        break
+                    time.sleep(0.01)
+                raise _Stop
+
+            def release(self):
+                pass
+
+        monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+        monkeypatch.setattr(monitor.alerts, "send_alert", fake_send)
+        monkeypatch.setattr(monitor.alerts, "telegram_configured", lambda: True)
+        monkeypatch.setattr(monitor, "verify_enabled", lambda: True)
+        monkeypatch.setattr(monitor, "verify_probe", lambda: (True, None))
+        monkeypatch.setattr(monitor, "run_pose_gate", lambda d: checked.append(d) or "escalate")
+        monkeypatch.setattr(monitor, "run_verify", lambda d: checked.append(d))
+        monkeypatch.setattr(monitor, "_open_live", lambda source, *a: (Cap(), False, None))
+        with pytest.raises(_Stop):
+            monitor.run("rtsp://x/mi360", out_root=root, name="mi360")
+        assert sent == [(text, ev / "base" / "frame_001_t_0.500s.jpg", None)]
+        assert checked == []
+        assert monitor.read_handled(ev)["delivered"] is True
 
 
 QUIET_FRAME = np.full((360, 640, 3), 40, np.uint8)
@@ -965,7 +1301,7 @@ class TestLiveRun:
                 release.set()
             return result
 
-        def process(event_dir, use_verify, outage_notifier, fb=None):
+        def process(event_dir, use_verify, outage_notifier):
             if processed:
                 processed.append(None)
                 return
@@ -989,7 +1325,7 @@ class TestLiveRun:
                             lambda self, msg: pings.append(live.clock[0]))
         processing, unblock = threading.Event(), threading.Event()
 
-        def process(event_dir, use_verify, outage_notifier, fb=None):
+        def process(event_dir, use_verify, outage_notifier):
             processing.set()
             unblock.wait(10)
 
@@ -1029,7 +1365,7 @@ class TestLiveRun:
         start = live.clock[0]
         _make_event(live.root, "event_20260925_010000_mi360", n_frames=1)
         processed, done_before_open = threading.Event(), []
-        live.verify_on(lambda event_dir, use_verify, notifier, fb=None: processed.set())
+        live.verify_on(lambda event_dir, use_verify, notifier: processed.set())
 
         class Cap:
             def read(self):
@@ -1056,7 +1392,7 @@ class TestLiveRun:
                             lambda self, msg: pings.append(live.clock[0]))
         processing, unblock = threading.Event(), threading.Event()
 
-        def process(event_dir, use_verify, outage_notifier, fb=None):
+        def process(event_dir, use_verify, outage_notifier):
             processing.set()
             unblock.wait(10)
 
@@ -1101,6 +1437,66 @@ class TestLiveRun:
 
     def test_backlog_from_live_captures_is_announced_once(self, live, monkeypatch):
         assert len(self._waiting_alerts(live, monkeypatch, swept=9, captures=4)) == 1
+
+    def test_undelivered_backlog_alert_is_retried(self, live, monkeypatch):
+        attempts = []
+
+        def deliver():
+            attempts.append(1)
+            return len(attempts) > 1              # the first one is lost
+
+        live.deliver = deliver
+        assert len(self._waiting_alerts(live, monkeypatch, swept=12, captures=1)) == 2
+        assert len(attempts) == 2
+
+    def test_stall_captures_the_motion_in_flight(self, live, monkeypatch):
+        """Regression: motion in progress when the stream died was captured
+        only after the stall, from a ring that by then held nothing of it,
+        so the event went to verify as one quiet frame."""
+        captured = []
+        real_capture = monitor.capture_event
+
+        def capture(*args, **kwargs):
+            captured.append(live.clock[0])
+            return real_capture(*args, **kwargs)
+
+        monkeypatch.setattr(monitor, "capture_event", capture)
+        monkeypatch.setattr(monitor, "process_event", lambda *a: None)
+        cap = _StallCap(live.clock, motion_sec=20.0, stall_sec=150.0)
+        live.start(cap)
+        assert len(captured) == 1 and captured[0] < cap.stall_end
+        event_dir, = live.root.iterdir()
+        base = [_frame_time(p) for p in (event_dir / "base").glob("frame_*.jpg")]
+        assert len(base) >= 2 * 18 and max(base) >= 18.0    # the 20 s of motion
+        assert len(list((event_dir / monitor.alert_clip.RING_DIR).glob("*.jpg"))) >= 15 * 18
+
+
+class _StallCap:
+    """`motion_sec` of motion, then a dead stream for `stall_sec` (each
+    failed read sleeps 60 s of fake time), then 3 s of quiet frames. Each
+    good read is 1/15 s."""
+
+    def __init__(self, clock, motion_sec, stall_sec):
+        self.clock, self.t0 = clock, clock[0]
+        self.motion_end = self.t0 + motion_sec
+        self.stall_end = self.motion_end + stall_sec
+        self.i = self.after = 0
+
+    def read(self):
+        clock = self.clock
+        if self.motion_end <= clock[0] < self.stall_end:
+            return False, None
+        if clock[0] >= self.stall_end:
+            self.after += 1
+            if self.after > 45:
+                raise _Stop
+        clock[0] += 1 / 15
+        self.i += 1
+        return True, (_motion_frame(self.i) if clock[0] < self.motion_end
+                      else QUIET_FRAME.copy())
+
+    def release(self):
+        pass
 
 
 class _MotionEventsCap:

@@ -1,14 +1,15 @@
 """Builds the short alert video: picks the time window of the
 highest-confidence positive batch from analysis.json (the moment the
 verifier was most sure), clamps it to 5-10 s, and cuts a small MP4 from
-that window — preferring the full-rate event recording (event.mp4, saved
-from the ring buffer at capture time) and falling back to the sparse
-analysis frames for older events.
+that window — preferring the full-rate event recording (event.mp4, built
+from the ring buffer frames spilled to ring/ at capture time) and falling
+back to the sparse analysis frames for older events.
 
 Every failure returns None — the alert itself must never be blocked by
 clip encoding; the caller falls back to the peak-frame photo.
 """
 import json
+import shutil
 from pathlib import Path
 
 from verify_event import BATCH_SIZE, frame_time
@@ -16,6 +17,7 @@ from verify_event import BATCH_SIZE, frame_time
 MIN_CLIP_SEC = 5.0
 MAX_CLIP_SEC = 10.0
 MIN_FPS, MAX_FPS = 2.0, 20.0
+RING_DIR = "ring"            # full-rate ring JPEGs, until event.mp4 is built
 
 
 def event_frames(event_dir):
@@ -70,24 +72,48 @@ def _open_writer(cv2, out_path, fps, size):
     return None
 
 
-def save_event_video(fb, event_dir, t_start, t_end):
-    """Encode the ring buffer's full-rate JPEG frames for the event window
-    into event.mp4 + a times sidecar. This is what alert clips are cut
-    from, at the ring's native rate instead of the sparse analysis
-    sampling. Returns the path or None; never raises."""
+def spill_ring(fb, event_dir):
+    """Write the ring buffer's full-rate JPEGs for the event window into
+    ring/, the time in each file name. They are already JPEG bytes, so this
+    is plain file I/O; the event video is built from them later, after a
+    restart too, without holding the frames in memory. Never raises."""
+    try:
+        ring_dir = Path(event_dir) / RING_DIR
+        ring_dir.mkdir(parents=True, exist_ok=True)
+        for i, (t, jpg) in enumerate(zip(fb.times, fb.frames)):
+            (ring_dir / f"{i:05d}_{t:.4f}.jpg").write_bytes(jpg.tobytes())
+    except Exception as e:
+        print(f"[WARN] could not spill the ring frames ({e}); no event video")
+
+
+def _ring_frames(ring_dir):
+    """(t, path) of the spilled ring frames, in capture order."""
+    items = []
+    for p in ring_dir.glob("*.jpg"):
+        i, t = p.stem.split("_", 1)
+        items.append((int(i), float(t), p))
+    return [(t, p) for _, t, p in sorted(items)]
+
+
+def save_event_video(event_dir, t_start):
+    """Encode the spilled ring frames (ring/) into event.mp4 + a times
+    sidecar, then delete ring/. This is what alert clips are cut from, at
+    the ring's native rate instead of the sparse analysis sampling. Returns
+    the path, or None with no ring/ (older events, or already built) or on
+    failure; never raises."""
+    ring_dir = Path(event_dir) / RING_DIR
+    if not ring_dir.is_dir():
+        return None
     try:
         import cv2
-        import numpy as np
 
-        items = [(t, jpg) for t, jpg in zip(fb.times, fb.frames)
-                 if t_start <= t <= t_end]
+        items = _ring_frames(ring_dir)
         if len(items) < 4:
             return None
         duration = max(0.5, items[-1][0] - items[0][0])
         fps = max(MIN_FPS, min(MAX_FPS, len(items) / duration))
 
-        first = cv2.imdecode(np.frombuffer(items[0][1].tobytes(), np.uint8),
-                             cv2.IMREAD_COLOR)
+        first = cv2.imread(str(items[0][1]))
         if first is None:
             return None
         h, w = first.shape[:2]
@@ -96,9 +122,8 @@ def save_event_video(fb, event_dir, t_start, t_end):
         if writer is None:
             return None
         times = []
-        for t, jpg in items:
-            img = cv2.imdecode(np.frombuffer(jpg.tobytes(), np.uint8),
-                               cv2.IMREAD_COLOR)
+        for t, p in items:
+            img = cv2.imread(str(p))
             if img is None:
                 continue
             if img.shape[:2] != (h, w):
@@ -111,6 +136,10 @@ def save_event_video(fb, event_dir, t_start, t_end):
         return out_path if out_path.exists() and out_path.stat().st_size > 0 else None
     except Exception:
         return None
+    finally:
+        # A failed encode would fail the same way again; a process killed
+        # mid-encode never gets here and leaves ring/ for the next attempt.
+        shutil.rmtree(ring_dir, ignore_errors=True)
 
 
 def _clip_from_event_video(cv2, event_dir, t_lo, t_hi, out_path):
