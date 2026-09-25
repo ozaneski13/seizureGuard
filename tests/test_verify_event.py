@@ -77,6 +77,15 @@ def _confirm_reply(present=(), abnormal=False, indent=None,
     return body[:-1].rstrip() + f',{sep}"note": "{note}"' + ("\n}" if indent else "}")
 
 
+def _note_first_reply(present=()):
+    """The top-level note, with inner quotes, placed ahead of observed_signs."""
+    signs = [{"sign": s, "present": s in present, "body_region": "legs",
+              "sustained": False} for s in ve.ALL_SIGNS]
+    return ('{"abnormal_event": false, "confidence": 0.6, "posture": "lying_lateral", '
+            '"partially_visible": false, "note": "legs "paddling" while lying", '
+            f'"observed_signs": {json.dumps(signs)}}}')
+
+
 class TestTolerantParse:
     """Regression: a strict parse over the whole reply lost confirm verdicts
     to a flaw in the free-text note (live 2026-09-02 and 2026-09-25: both
@@ -97,6 +106,40 @@ class TestTolerantParse:
         v = ve.parse_json_verdict(text)
         assert v["abnormal_event"] is False
         assert ve.decide_signs(v) is False
+
+    def test_note_before_the_signs_is_not_cut_into_a_clean_negative(self):
+        # A broken note ahead of observed_signs: cutting at it leaves a
+        # sign-less verdict that reads as a clean negative while paddling
+        # is marked present further on.
+        text = _note_first_reply(present=("paddling",))
+        v = ve.parse_json_verdict(text)
+        assert ve.decide_signs(v) is True
+        assert v["salvaged"] is True
+
+    def test_note_before_the_signs_on_a_negative_is_a_failure(self):
+        # Nothing positive to salvage, and the cut lost the signs: unverified,
+        # never a silent negative.
+        with pytest.raises(ValueError):
+            ve.parse_json_verdict(_note_first_reply())
+
+    def test_only_the_trailing_note_is_cut(self):
+        # Sign entries carrying their own note must not be cut through.
+        signs = [{"sign": s, "present": False, "note": "still"} for s in ve.ALL_SIGNS]
+        body = json.dumps({"abnormal_event": False, "confidence": 0.4,
+                           "observed_signs": signs})
+        text = body[:-1] + ', "note": "dog "settling" down"}'
+        v = ve.parse_json_verdict(text)
+        assert v["abnormal_event"] is False
+        assert len(v["observed_signs"]) == len(ve.ALL_SIGNS)
+        assert not v.get("salvaged")
+
+    def test_prose_with_a_brace_before_the_object(self):
+        # Every '{' is tried, not just the first.
+        text = "Checked {all 10 signs}:\n" + json.dumps(
+            {"abnormal_event": False, "confidence": 0.3, "observed_signs": []})
+        v = ve.parse_json_verdict(text)
+        assert v["abnormal_event"] is False
+        assert "salvaged" not in v
 
     def test_trailing_prose_with_braces(self):
         body = json.dumps({"abnormal_event": True, "confidence": 0.7,
@@ -428,6 +471,12 @@ class TestBackendOutageClassification:
         assert ve.is_backend_outage("Expecting ',' delimiter: line 9 column 5 (char 429)",
                                     kind="parse") is False
 
+    def test_bare_429_outside_cli_text_is_not_an_outage(self):
+        # "429" as a JSON offset, where only the CLI-text guard stops it.
+        err = "Expecting ',' delimiter: line 1 column 430 (char 429)"
+        assert ve.is_backend_outage(err) is False
+        assert ve.is_backend_outage(err, kind="call") is False
+
     def test_parse_kind_is_never_an_outage(self):
         err = "Unparseable model reply: I can't authenticate this; quota of frames overloaded"
         assert ve.is_backend_outage(err, kind="parse") is False
@@ -561,6 +610,14 @@ class TestValueCoercion:
         assert r["abnormal_event"] is True
         assert r["confidence"] == 0.0
 
+
+    def test_openai_decode_error_is_a_parse_failure(self, monkeypatch):
+        def bad_json(*a, **k):
+            raise json.JSONDecodeError("Expecting value", "doc", 429)
+        monkeypatch.setattr(ve, "ask_openai", bad_json)
+        r = ve.assess_batch_openai(None, None, [], ve.get_config(), 1)
+        assert r["error_kind"] == "parse"
+        assert ve.outage_reason([r]) is None
 
 class TestBatchGuard:
     def test_unexpected_batch_crash_keeps_other_batches(

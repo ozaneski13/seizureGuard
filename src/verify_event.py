@@ -168,14 +168,19 @@ def parse_json_verdict(text):
     the grayscale run, 2026-09-25) were unescaped double quotes in the
     free-text note, the schema's last member; a strict parse of the whole
     reply threw away the decisive fields before it. So: parse leniently,
-    then retry without the note, then salvage a positive from the raw text.
-    Raises VerdictParseError when nothing usable is left."""
+    then retry without the trailing note, then salvage a positive from the
+    raw text. Raises VerdictParseError when nothing usable is left."""
     cleaned = strip_fences(text)
     verdict, error = _find_verdict(cleaned)
     if verdict is None:
-        note = re.search(r',?\s*"note"\s*:', cleaned)
-        if note:
-            verdict, _ = _find_verdict(cleaned[:note.start()].rstrip() + "}")
+        notes = list(re.finditer(r',?\s*"note"\s*:', cleaned))
+        if notes:
+            verdict, _ = _find_verdict(cleaned[:notes[-1].start()].rstrip() + "}")
+        # A note placed before the signs cuts them off, and the rest reads
+        # as a clean negative: a positive salvage wins, and a cut without
+        # its signs is no verdict.
+        if verdict is not None and not decide_signs(verdict):
+            verdict = _salvage(text) or (verdict if "observed_signs" in verdict else None)
     if verdict is None:
         verdict = _salvage(text)
     if verdict is None:
