@@ -160,6 +160,30 @@ class TestPeakNote:
         assert event_server.scan_events(tmp_path)[0]["note"] == ""
 
 
+class TestSigns:
+    """Regression: the claude-cli verifier stores observed_signs as the model
+    returned them, and one string entry in a positive batch made every
+    request to the viewer fail (AttributeError in collect_signs)."""
+
+    def test_odd_sign_shapes_do_not_break_the_index(self, tmp_path):
+        _event(tmp_path, "event_20260901_100000_a", True, 0.8, batches=[
+            {"abnormal_event": True,
+             "observed_signs": ["paddling", None, 3, {"sign": "paddling", "present": True}]},
+            {"abnormal_event": True, "observed_signs": "loss_of_posture"},
+            {"abnormal_event": True, "observed_signs": 7},
+            {"abnormal_event": True, "observed_signs": {"sign": "jaw_clonus", "present": True}},
+            {"abnormal_event": True, "observed_signs": [
+                {"sign": 5, "present": True}, {"sign": None, "present": True},
+                {"sign": ["tonic_stiffening"], "present": True},
+                {"sign": "drooling", "present": True}]},
+            "junk"])
+        items = event_server.scan_events(tmp_path)
+        assert items[0]["signs"] == ["paddling", "drooling"]
+        page = event_server.index_html(items, "default", "all")
+        assert "paddling, drooling" in page
+        assert "drooling" in event_server.detail_html(items[0])
+
+
 def test_video_range_request_returns_partial_content(tmp_path):
     payload = bytes(range(256)) * 16
     _event(tmp_path, "event_20260901_100000_a", True, 0.8, video=payload)

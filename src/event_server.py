@@ -63,14 +63,20 @@ def read_analysis(event_dir):
 
 
 def collect_signs(analysis):
-    """Pozitif batch'lerde gozlenen isaretleri benzersizlestir."""
+    """Pozitif batch'lerde gozlenen isaretleri benzersizlestir. Claude-cli
+    observed_signs'i modelin dondurdugu gibi saklar, her sekil gelebilir:
+    tek bir tuhaf kayit tum goruntuleyiciyi dusurmemeli."""
     signs = []
     for b in (analysis.get("batches") or []):
-        if b.get("abnormal_event") is not True:
+        if not isinstance(b, dict) or b.get("abnormal_event") is not True:
             continue
-        for s in (b.get("observed_signs") or []):
-            if s.get("present") and s.get("sign") not in signs:
-                signs.append(s.get("sign"))
+        entries = b.get("observed_signs")
+        for s in entries if isinstance(entries, list) else []:
+            if not isinstance(s, dict) or not s.get("present"):
+                continue
+            sign = s.get("sign")
+            if isinstance(sign, str) and sign not in signs:
+                signs.append(sign)
     return signs
 
 
