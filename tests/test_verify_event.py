@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -789,6 +790,7 @@ class TestLoginError:
                    for b in out["batches"])
         assert out["final_abnormal_event"] is False
         assert "not logged in" in out["backend_outage"]
+        assert out["complete"] is True       # a rerun must not resume it
 
     def test_positive_before_the_login_error_is_kept(self, monkeypatch, synthetic_event_dir):
         def assess(event_dir, paths, config, bi):
@@ -831,8 +833,109 @@ def test_analysis_json_is_replaced_atomically(monkeypatch, synthetic_event_dir):
         lambda p: {"abnormal_event": False, "confidence": 0.1, "observed_signs": []}))
     out = _run_main(monkeypatch, synthetic_event_dir)
     target = synthetic_event_dir / "analysis.json"
-    assert len(replaced) == 1
-    src, dst = replaced[0]
-    assert dst == target and src.parent == synthetic_event_dir and src != target
-    assert not src.exists()
+    assert len(replaced) == len(out["batches"])      # once per batch, see TestResume
+    for src, dst in replaced:
+        assert dst == target and src.parent == synthetic_event_dir and src != target
+        assert not src.exists()
+    assert out["complete"] is True
     assert out["final_abnormal_event"] is False
+
+
+class _Killed(BaseException):
+    """Stands in for systemd killing the run: nothing in main() catches it."""
+
+
+def _batch(abnormal, confidence=0.5):
+    signs = [{"sign": "paddling", "present": True}] if abnormal else []
+    return {"abnormal_event": abnormal, "confidence": confidence, "screen_verdict": None,
+            "escalated": True, "observed_signs": signs}
+
+
+class TestResume:
+    """Regression: analysis.json was written once, after the last batch, so a
+    restart mid-run lost every verdict so far, and the rerun could answer
+    negative where the killed run had already found a positive."""
+
+    @pytest.fixture
+    def event_dir(self, synthetic_event_dir, tmp_path):
+        d = tmp_path / synthetic_event_dir.name
+        shutil.copytree(synthetic_event_dir, d)
+        (d / "analysis.json").unlink(missing_ok=True)
+        return d
+
+    def _read(self, event_dir):
+        return json.loads((event_dir / "analysis.json").read_text())
+
+    def _kill_after(self, monkeypatch, event_dir, n, verdict_for):
+        def assess(event_dir_, paths, config, bi):
+            if bi > n:
+                raise _Killed()
+            return verdict_for(bi)
+
+        monkeypatch.setattr(ve, "assess_batch_claude", assess)
+        monkeypatch.setattr(sys, "argv", ["verify_event.py", str(event_dir)])
+        with pytest.raises(_Killed):
+            ve.main()
+        return self._read(event_dir)
+
+    def _rerun(self, monkeypatch, event_dir, verdict_for=lambda bi: _batch(False, 0.9)):
+        calls = []
+
+        def assess(event_dir_, paths, config, bi):
+            calls.append(bi)
+            return verdict_for(bi)
+
+        monkeypatch.setattr(ve, "assess_batch_claude", assess)
+        return _run_main(monkeypatch, event_dir), calls
+
+    def test_partial_file_after_every_batch(self, monkeypatch, event_dir):
+        out = self._kill_after(monkeypatch, event_dir, 2,
+                               lambda bi: _batch(bi == 1, 0.8))
+        assert out["complete"] is False
+        assert len(out["batches"]) == 2
+        # a positive already found is on disk as a positive
+        assert out["final_abnormal_event"] is True
+        assert out["positive_batches"] == 1 and out["final_confidence"] == 0.8
+
+    def test_partial_negative_says_it_is_incomplete(self, monkeypatch, event_dir):
+        out = self._kill_after(monkeypatch, event_dir, 1, lambda bi: _batch(False, 0.9))
+        assert out["complete"] is False
+        assert out["final_abnormal_event"] is False
+        assert "incomplete" in out["final_reason"]
+
+    def test_rerun_resumes_and_keeps_the_positive(self, monkeypatch, event_dir):
+        self._kill_after(monkeypatch, event_dir, 2, lambda bi: _batch(bi == 1, 0.8))
+        out, calls = self._rerun(monkeypatch, event_dir)
+        total = len(out["batches"])
+        assert total >= 4
+        assert calls == list(range(3, total + 1))     # batches 1-2 not asked again
+        assert out["complete"] is True
+        assert out["final_abnormal_event"] is True
+        assert out["batches"][0]["abnormal_event"] is True
+
+    def test_failed_batches_are_asked_again(self, monkeypatch, event_dir):
+        def first(bi):
+            return _batch(False, 0.9) if bi == 1 else ve.failed_batch("boom", ve.ERR_CALL)
+
+        self._kill_after(monkeypatch, event_dir, 2, first)
+        out, calls = self._rerun(monkeypatch, event_dir)
+        assert calls[0] == 2
+        assert out["failed_batches"] == 0
+
+    def test_other_frames_start_fresh(self, monkeypatch, event_dir):
+        self._kill_after(monkeypatch, event_dir, 2, lambda bi: _batch(bi == 1, 0.8))
+        sorted((event_dir / "burst").glob("frame_*.jpg"))[0].unlink()
+        out, calls = self._rerun(monkeypatch, event_dir)
+        assert calls[:2] == [1, 2]
+        assert out["final_abnormal_event"] is False
+
+    def test_complete_file_starts_fresh(self, monkeypatch, event_dir):
+        self._rerun(monkeypatch, event_dir, lambda bi: _batch(bi == 1, 0.8))
+        out, calls = self._rerun(monkeypatch, event_dir)
+        assert calls == list(range(1, len(out["batches"]) + 1))
+        assert out["final_abnormal_event"] is False
+
+    def test_unreadable_partial_file_starts_fresh(self, monkeypatch, event_dir):
+        (event_dir / "analysis.json").write_text("{truncated", encoding="utf-8")
+        out, calls = self._rerun(monkeypatch, event_dir)
+        assert calls == list(range(1, len(out["batches"]) + 1))

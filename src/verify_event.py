@@ -1,7 +1,9 @@
 """VLM verification of a captured event directory: each 30-frame batch goes
 to the confirm model, which assesses specific canine seizure signs; a
 deterministic rule layer decides, recall-first. Writes analysis.json into
-the event dir.
+the event dir after every batch, `complete: false` until the last one; a
+rerun over the same frames keeps the batches already answered and asks only
+the rest (see recorded_batches).
 
 Per-batch keys besides the verdict: a failed batch (abnormal_event None)
 carries `error` and `error_kind` - "parse" (the model replied but no verdict
@@ -562,6 +564,74 @@ def make_openai_client():
     return OpenAI(api_key=api_key)
 
 
+def recorded_batches(out_path, frame_names):
+    """{batch number: result} for the batches an interrupted run over the
+    same frames already answered. A finished analysis (or one over other
+    frames) is not resumed: the monitor only reruns verify when it chose
+    to. A failed batch is asked again; a verdict never is, since a second
+    answer could silence a positive the first one found."""
+    try:
+        prev = json.loads(out_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if (not isinstance(prev, dict) or prev.get("complete") is not False
+            or prev.get("frames") != frame_names or prev.get("batch_size") != BATCH_SIZE
+            or not isinstance(prev.get("batches"), list)):
+        return {}
+    return {bi: r for bi, r in enumerate(prev["batches"], start=1)
+            if isinstance(r, dict) and r.get("abnormal_event") is not None}
+
+
+def write_analysis(out_path, out):
+    # Written beside it, then renamed over it: the monitor reuses an existing
+    # analysis.json, so no reader may ever see a half-written one.
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    os.replace(tmp_path, out_path)
+
+
+def summarize(batch_results, login_error, complete):
+    """Event-level fields over the batches answered so far."""
+    # Event-level decision (recall-focused): pure OR over analyzed batches.
+    # A seizure that ended is still a seizure that happened — nothing may veto a true.
+    any_true = any(r.get("abnormal_event") is True for r in batch_results)
+    failed_batches = sum(1 for r in batch_results if r.get("abnormal_event") is None)
+    # Confidence OF THE FINDING. Taking the max over all analyzed batches
+    # let a plainly normal event report 0.85 (the confirm model reports
+    # confidence in its own verdict, not seizure probability), and an alert
+    # quoted 0.85 while its single positive batch was only 0.45.
+    positive_conf = [float(r.get("confidence", 0.0)) for r in batch_results
+                     if r.get("abnormal_event") is True]
+    analyzed_conf = [float(r.get("confidence", 0.0)) for r in batch_results
+                     if r.get("abnormal_event") is not None]
+    max_conf = max(positive_conf) if positive_conf else (
+        max(analyzed_conf) if analyzed_conf else 0.0)
+
+    if any_true:
+        final_reason = "Any batch true (recall-focused OR rule)."
+    elif failed_batches:
+        final_reason = (
+            f"No batch marked abnormal_event=true, but {failed_batches} batch(es) failed "
+            "and were never analyzed — treat this result as incomplete."
+        )
+    elif not complete:
+        final_reason = (f"No batch marked abnormal_event=true in the {len(batch_results)} "
+                        "analyzed so far — the run is incomplete.")
+    else:
+        final_reason = "No batch marked abnormal_event=true."
+
+    return {
+        "final_abnormal_event": any_true,
+        "final_confidence": max_conf,
+        "complete": complete,
+        "positive_batches": len(positive_conf),
+        "backend_outage": (str(login_error)[:200] if login_error is not None
+                           else outage_reason(batch_results)),
+        "failed_batches": failed_batches,
+        "final_reason": final_reason,
+    }
+
+
 # ------------------------------------------------------------------- main
 
 def main():
@@ -597,15 +667,33 @@ def main():
     else:
         assess = lambda paths, bi: assess_batch_claude(event_dir, paths, config, bi)
 
+    frame_names = [p.relative_to(event_dir).as_posix() for p in frames]
+    batches = list(iter_batches(frames, BATCH_SIZE))
+    out_path = event_dir / "analysis.json"
+    recorded = recorded_batches(out_path, frame_names)
+    base = {
+        "backend": config["backend"],
+        "confirm_model": (config["confirm_model"] if config["backend"] == "claude-cli"
+                          else config["openai_model"]),
+        "batch_size": BATCH_SIZE,
+        "num_frames": len(frames),
+        "base_frames": len(list(base_dir.glob("frame_*.jpg"))),
+        "burst_frames": len(list(burst_dir.glob("frame_*.jpg"))),
+        "frames": frame_names,
+    }
+
     batch_results = []
     login_error = None
-    for bi, batch in enumerate(iter_batches(frames, BATCH_SIZE), start=1):
+    for bi, batch in enumerate(batches, start=1):
         # One odd reply must not kill the run: analysis.json would never be
         # written and the other batches' positives would be lost with it.
         # A login error fails this batch and every later one without another
         # call; analysis.json still records it as a backend outage, so the
         # monitor announces it once instead of alerting on every event.
-        if login_error is not None:
+        if bi in recorded:
+            r = recorded[bi]
+            print(f"[INFO] Batch {bi}: kept from the interrupted run", flush=True)
+        elif login_error is not None:
             r = failed_batch(str(login_error), ERR_CALL)
         else:
             try:
@@ -619,59 +707,14 @@ def main():
         batch_results.append(r)
         print(f"[INFO] Batch {bi}: abnormal={r['abnormal_event']} "
               f"conf={r['confidence']:.2f} escalated={r['escalated']}", flush=True)
+        # After every batch, so a restart or the monitor's timeout loses at
+        # most the batch in flight, and a positive found so far is on disk.
+        out = summarize(batch_results, login_error, complete=bi == len(batches))
+        write_analysis(out_path, {**out, **base, "batches": batch_results})
 
-    # Event-level decision (recall-focused): pure OR over analyzed batches.
-    # A seizure that ended is still a seizure that happened — nothing may veto a true.
-    any_true = any(r.get("abnormal_event") is True for r in batch_results)
-    failed_batches = sum(1 for r in batch_results if r.get("abnormal_event") is None)
-    # Confidence OF THE FINDING. Taking the max over all analyzed batches
-    # let a plainly normal event report 0.85 (the confirm model reports
-    # confidence in its own verdict, not seizure probability), and an alert
-    # quoted 0.85 while its single positive batch was only 0.45.
-    positive_conf = [float(r.get("confidence", 0.0)) for r in batch_results
-                     if r.get("abnormal_event") is True]
-    analyzed_conf = [float(r.get("confidence", 0.0)) for r in batch_results
-                     if r.get("abnormal_event") is not None]
-    max_conf = max(positive_conf) if positive_conf else (
-        max(analyzed_conf) if analyzed_conf else 0.0)
-
-    final = any_true
-    if any_true:
-        final_reason = "Any batch true (recall-focused OR rule)."
-    elif failed_batches:
-        final_reason = (
-            f"No batch marked abnormal_event=true, but {failed_batches} batch(es) failed "
-            "and were never analyzed — treat this result as incomplete."
-        )
-    else:
-        final_reason = "No batch marked abnormal_event=true."
-
-    out = {
-        "final_abnormal_event": final,
-        "final_confidence": max_conf,
-        "backend": config["backend"],
-        "confirm_model": (config["confirm_model"] if config["backend"] == "claude-cli"
-                          else config["openai_model"]),
-        "batch_size": BATCH_SIZE,
-        "num_frames": len(frames),
-        "base_frames": len(list(base_dir.glob("frame_*.jpg"))),
-        "burst_frames": len(list(burst_dir.glob("frame_*.jpg"))),
-        "positive_batches": len(positive_conf),
-        "backend_outage": (str(login_error)[:200] if login_error is not None
-                           else outage_reason(batch_results)),
-        "failed_batches": failed_batches,
-        "final_reason": final_reason,
-        "batches": batch_results,
-    }
-
-    # Written beside it, then renamed over it: the monitor reuses an existing
-    # analysis.json, so no reader may ever see a half-written one.
-    out_path = event_dir / "analysis.json"
-    tmp_path = out_path.with_name(out_path.name + ".tmp")
-    tmp_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
-    os.replace(tmp_path, out_path)
     print("✅ Analysis written to:", out_path)
-    print(json.dumps({"final_abnormal_event": final, "final_confidence": max_conf}, indent=2))
+    print(json.dumps({"final_abnormal_event": out["final_abnormal_event"],
+                      "final_confidence": out["final_confidence"]}, indent=2))
     if login_error is not None:
         raise login_error
 
