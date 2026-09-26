@@ -247,6 +247,12 @@ BACKEND_OUTAGE_MARKERS = (
     "authenticate",
 )
 
+# Plan-limit wording changes: "You've hit your limit · resets Sep 5" became
+# "You've hit your monthly spend limit · raise it at ...?from=cc_cli_limit_message
+# · your weekly limit resets 7pm" (2026-09-26), which no marker above matched,
+# so every event alerted UNVERIFIED instead of one outage notice. Match the shape.
+PLAN_LIMIT_RE = re.compile(r"hit your\b[^\n]{0,40}?\blimit|limit resets|cc_cli_limit_message")
+
 # Batch "error_kind": where a failure came from. Only a failed call can be
 # a backend outage; a reply that did not parse, or a crash in this script,
 # is about this event. Batches written before the field existed have none.
@@ -262,7 +268,7 @@ def is_backend_outage(error_text, kind=None):
     if not error_text or kind not in (None, ERR_CALL):
         return False
     low = str(error_text).lower()
-    if any(m in low for m in BACKEND_OUTAGE_MARKERS):
+    if any(m in low for m in BACKEND_OUTAGE_MARKERS) or PLAN_LIMIT_RE.search(low):
         return True
     # A bare "429" also matched JSON offsets ("char 1429"); trust it only
     # in the CLI's own error text.

@@ -538,6 +538,22 @@ class TestBackendOutageClassification:
     def test_quota_error_is_an_outage(self):
         assert ve.is_backend_outage("claude CLI error: You've hit your limit · resets Sep 5")
 
+    def test_reworded_plan_limit_is_an_outage(self):
+        """Regression (2026-09-26): the CLI's new wording matched no marker,
+        so a quota outage alerted UNVERIFIED on every event."""
+        live = ("claude CLI error: You've hit your monthly spend limit · raise it at "
+                "claude.ai/settings/usage?from=cc_cli_limit_message · your weekly "
+                "limit resets 7pm (Europe/Istanbul)")
+        assert ve.is_backend_outage(live, kind="call")
+        batches = [{"abnormal_event": None, "error_kind": "call", "error": live}] * 5
+        assert ve.outage_reason(batches) == live[:200]
+        assert ve.is_backend_outage("claude CLI error: You've hit your weekly limit")
+        assert ve.is_backend_outage("claude CLI error: your session limit resets 5:30am")
+
+    def test_limit_words_in_a_parse_error_are_not_an_outage(self):
+        assert not ve.is_backend_outage("reply mentions: you've hit your limit", kind="parse")
+        assert not ve.is_backend_outage("claude CLI error: speed limit sign visible")
+
     def test_auth_errors_are_outages(self):
         assert ve.is_backend_outage("401 OAuth access token has expired")
         assert ve.is_backend_outage("Not logged in · Please run /login")
