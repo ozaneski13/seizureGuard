@@ -1603,6 +1603,10 @@ def live(monkeypatch, tmp_path):
 
     monkeypatch.setattr(monitor.alerts, "send_alert", fake_send)
     monkeypatch.setattr(monitor.alerts, "telegram_configured", lambda: True)
+    workers = []
+    real_worker = monitor.EventWorker
+    monkeypatch.setattr(monitor, "EventWorker",
+                        lambda *a, **k: workers.append(real_worker(*a, **k)) or workers[-1])
 
     def start(cap=None):
         """Runs until _Stop; with no cap, open_capture stays the test's own."""
@@ -1620,7 +1624,15 @@ def live(monkeypatch, tmp_path):
     state.verify_on = verify_on
 
     state.start = start
-    return state
+    yield state
+    # run() leaves its worker thread running when _Stop ends it, and the worker
+    # looks process_event up per event: a live one called the NEXT test's
+    # patched process_event with this test's events (flaky on slow CI,
+    # 2026-09-26). Drain every worker through a no-op before the patches go.
+    monkeypatch.setattr(monitor, "process_event", lambda *a, **k: True)
+    for w in workers:
+        w.close()
+        assert not w.thread.is_alive()
 
 
 class _DeadStreamCap:
