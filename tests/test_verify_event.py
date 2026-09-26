@@ -376,7 +376,7 @@ class TestClaudeBackendFlow:
         monkeypatch.setattr(ve, "run_claude", fake)
         r = ve.assess_batch_claude(tmp_path, [], ve.get_config(), 1)
         assert r["abnormal_event"] is False
-        assert calls == ["claude-fable-5"]
+        assert calls == ["claude-opus-5-5"]
         assert r["screen_verdict"] is None
 
     def test_positive_confirm_marks_batch(self, monkeypatch, tmp_path):

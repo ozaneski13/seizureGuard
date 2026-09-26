@@ -190,8 +190,9 @@ alerts, and after a restart too.
 2. Run `claude` in a terminal once and log in with `/login`.
 
 That's it — the monitor auto-detects the login at startup and makes one
-real call to prove it works. Verification uses `claude-fable-5` (an A/B test
-on real seizure footage showed weaker models missing it — see FOLLOWUPS.md).
+real call to prove it works. Verification uses `claude-opus-5-5`, chosen by
+A/B tests on real seizure footage (other models missed it too often; see
+FOLLOWUPS.md). It needs Claude Code 2.1.283 or newer.
 
 **OpenAI (alternative):** set `SEIZUREGUARD_BACKEND=openai` and
 `OPENAI_API_KEY=<your key>`.
@@ -308,7 +309,7 @@ Watch the printed scores during normal activity, then adjust `MOTION_ON` /
 |---|---|---|
 | `SEIZUREGUARD_BACKEND` | `claude-cli` | `claude-cli` or `openai` |
 | `SEIZUREGUARD_PROBE_MODEL` | `claude-haiku-4-5` | cheap model for the one startup health-check call |
-| `SEIZUREGUARD_CONFIRM_MODEL` | `claude-fable-5` | verification model (seizure signs) |
+| `SEIZUREGUARD_CONFIRM_MODEL` | `claude-opus-5-5` | verification model (seizure signs) |
 | `SEIZUREGUARD_MODEL` | `gpt-4.1-mini` | model for the openai backend |
 | `OPENAI_API_KEY` | — | required for the openai backend |
 | `SEIZUREGUARD_VERIFY` | auto | `0` disables AI verification, `1` forces it |

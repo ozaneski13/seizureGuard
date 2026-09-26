@@ -96,10 +96,14 @@ VISION_CAUTIONS = (
 def get_config():
     return {
         "backend": os.environ.get("SEIZUREGUARD_BACKEND", "claude-cli"),
-        # A/B on the owner's real seizure recording (2026-08-09): sonnet-5
-        # confirm called all 6 seizure batches normal; fable-5 flagged all 6
-        # with hard signs. Confirm quality is what the alert rides on.
-        "confirm_model": os.environ.get("SEIZUREGUARD_CONFIRM_MODEL", "claude-fable-5"),
+        # Confirm quality is what the alert rides on. 2026-08-09: sonnet-5
+        # called all 6 seizure batches normal, fable-5 flagged them. 2026-09-26,
+        # same prompt, owner's seizure: opus-5-5 alerted 5/5 colour + 2/2 gray
+        # with 2-4 of 6 batches positive; fable-5 1/3 today (~60% over two
+        # days); fable-5-1 0/5. opus-5-5 stayed silent on all 4 known false
+        # alarms and alerted on 1 of 20 recent real negatives. Needs claude
+        # CLI >= 2.1.283 (older versions reject the model id).
+        "confirm_model": os.environ.get("SEIZUREGUARD_CONFIRM_MODEL", "claude-opus-5-5"),
         "openai_model": os.environ.get("SEIZUREGUARD_MODEL", "gpt-4.1-mini"),
     }
 

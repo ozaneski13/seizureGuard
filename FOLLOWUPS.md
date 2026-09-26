@@ -558,6 +558,27 @@ a second independent confirm call for recumbent batches it calls
 negative with low confidence (cost: extra calls on those batches only),
 or more real seizure footage to calibrate against.
 
+**Model comparison, 2026-09-26 → switched to `claude-opus-5-5`.** Same
+deployed prompt, same copies, all three models run at the same hour
+through the claude CLI (updated 2.1.142 → 2.1.283; 2.1.142 rejected both
+new ids, 2.1.274 "stable" did not know opus-5-5):
+
+| Model | Real seizure, colour | Grayscale | 4 known false alarms | s per batch |
+|---|---|---|---|---|
+| **claude-opus-5-5** | **alert 5/5**, 2-4 of 6 batches each | **2/2** (4/6, 2/6) | **silent 4/4** | ~10 |
+| claude-fable-5 (previous) | alert 1/3 (6/10 over two days) | - | - | ~21 |
+| claude-fable-5-1 | **alert 0/5** | 1/2 | alerted on 2 of 4 | ~16 |
+
+Opus 5.5 reads the seizure as long stretches of limb motion on its side
+("7-13 s", "17-31.5 s"), not as one borderline 3 s window, so the margin
+went from one coin-flip batch to several batches. On 20 recent real events
+that fable-5 had verified negative, it alerted once: at 01:59 the dog stood
+with its head held against a wall corner for ~6 s, which it flagged as
+possible head pressing/disorientation ("may also be normal sniffing").
+That borderline case is the kind worth seeing. Fable 5.1, the "most
+capable" model, was the worst here. Model rank on this task is empirical,
+so re-run this table when a new model appears.
+
 Also fixed in the same pass: `final_confidence` is now the confidence of
 the *finding* (max over positive batches) instead of the max over all
 analyzed batches — a normal event used to report 0.85, and the first false
